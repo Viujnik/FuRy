@@ -1,0 +1,12 @@
+[package]
+name = "fury-py"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "fury_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3.workspace = true
+fury-core = { path = "../fury-core" }
