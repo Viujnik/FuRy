@@ -1,31 +1,41 @@
 # FuRy
 
-**FuRy** is a high-performance binary bridge designed to eliminate JSON serialization overhead. It maps **PostgreSQL** wire protocol payloads directly into **FlatBuffers** using zero-copy principles and Rust-native byte-swapping.
+**FuRy** is a cross-platform data ecosystem that eliminates JSON serialization overhead
+by mapping database wire protocols directly into **FlatBuffers** binary format using zero-copy principles.
 
 ---
 
-### Overview
+## Overview
 
-Why parse when you can map? FuRy is built for engineers who value every CPU cycle. It provides a direct path from DB binary data to the frontend, bypassing heavy serialization layers.
-
----
-
-### Core objectives
-
-*   **Performance Optimization:** Achieving faster data transfer by eliminating the overhead of JSON serialization and parsing.
-*   **Memory Safety:** Leveraging Rust's ownership model to ensure secure and reliable binary data manipulation.
-*   **Architectural Efficiency:** Providing a direct mapping between database wire protocols and client-side binary formats.
-*   **Developer Experience:** Automating schema generation to reduce manual integration effort between backend and frontend.
+FuRy provides a unified core that handles database connections, query execution, and binary data transformation.
+Instead of parsing JSON and allocating thousands of heavy objects in high-level languages, FuRy delivers raw FlatBuffers
+buffers
+directly to your application layer with zero intermediate parsing.
 
 ---
 
-### Tech Stack
+## Core Objectives
 
-*   **Language:** Rust (Core).
-*   **Protocols:** FlatBuffers.
-*   **License:** Apache 2.0.
+- **Zero-Copy Performance**: Direct mapping from database binary responses to FlatBuffers without intermediate
+  serialization/deserialization
+- **Multi-Database Support**: Unified interface for relational and analytical databases
+- **Memory Safety**: Core ensures safe binary data manipulation across language boundaries
+- **Developer Experience**: Automatic schema generation from type annotations — no manual `.fbs` files required
+- **Language Agnostic**: Core with native bindings for multiple languages
 
 ---
 
-### Status: First Blood
-The project is currently in the **active research** phase.
+## Architecture
+
+The project follows the **Core Engine Pattern**:
+
+1. **fury-core**: Database connection pools, FlatBuffers runtime compiler, schema registry with offset caching
+2. **Language Bindings**: Native bindings with zero-overhead field access for supported languages
+3. **CLI Tools**: Code generation utilities for frontend integration
+
+---
+
+## Status: First Blood
+
+The project is in **active development**. Core workspace structure is initialized, and database integration is in
+progress.
