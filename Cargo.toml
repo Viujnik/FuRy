@@ -7,9 +7,10 @@ members = [
 ]
 
 [workspace.dependencies]
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "macros"] }
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "any", "chrono", "uuid", "macros"] }
 tokio = { version = "1.36", features = ["full"] }
 flatbuffers = "25.12.19"
 thiserror = "2.0.18"
 dashmap = "6.2.1"
-pyo3 = { version = "0.29.0", features = ["extension-module"] }
+pyo3 = { version = "0.29.0", features = ["extension-module", "experimental-async"] }
+pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }

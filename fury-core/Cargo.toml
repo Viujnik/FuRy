@@ -1,11 +1,11 @@
 [package]
 name = "fury-core"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-sqlx.workspace = true
-tokio.workspace = true
-flatbuffers.workspace = true
-thiserror.workspace = true
-dashmap.workspace = true
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4"] }
+parking_lot = "0.12"

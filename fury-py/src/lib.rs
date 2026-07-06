@@ -1,14 +1,24 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use pyo3::prelude::*;
+use std::sync::OnceLock;
+
+mod conversion;
+mod db;
+mod errors;
+mod models;
+
+use db::FuryDB;
+use fury_core::schema::registry::SchemaRegistry;  // ✅ Один импорт
+use models::BaseModel;
+
+static GLOBAL_REGISTRY: OnceLock<SchemaRegistry> = OnceLock::new();
+
+pub fn get_global_registry() -> &'static SchemaRegistry {
+    GLOBAL_REGISTRY.get_or_init(SchemaRegistry::new)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+#[pymodule]
+fn fury(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<FuryDB>()?;
+    m.add_class::<BaseModel>()?;
+    Ok(())
 }

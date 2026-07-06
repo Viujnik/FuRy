@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "fury_py"
+name = "fury"
 crate-type = ["cdylib"]
 
 [dependencies]
 pyo3.workspace = true
+pyo3-async-runtimes.workspace = true
 fury-core = { path = "../fury-core" }
+chrono = "0.4.45"
+tokio = "1.52.3"
+
+sqlx = { workspace = true }
