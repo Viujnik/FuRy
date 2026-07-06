@@ -62,7 +62,6 @@ fury-go/*.h
 *.iml
 *.ipr
 *.iws
-2026-07-06_18-09-19.png
 # VS Code
 .vscode/
 *.code-workspace
