@@ -51,7 +51,6 @@ impl FuryDB {
         let sql_args = parse_sql_args(args)?;
         let executor = Arc::clone(&self.executor);
 
-        // 🔑 Отвязываем от GIL для передачи в async (Py<T> является Send)
         let model_class_py: Py<PyAny> = model_class.unbind();
 
         future_into_py(py, async move {
@@ -82,12 +81,10 @@ impl FuryDB {
 
             buffer.finish().map_err(fury_error_to_pyerr)?;
 
-            // 🔑 Захватываем GIL и возвращаем Py<PyAny> (не Bound!)
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let model_class_bound = model_class_py.bind(py);
                 let instance: Py<PyAny> =
                     create_py_model_instance(model_class_bound.clone(), &schema, &buffer)?;
-                // Возвращаем Py<PyAny>, который является Send
                 Ok(instance)
             })
         })
@@ -126,7 +123,6 @@ impl FuryDB {
                 buffers.push(buffer);
             }
 
-            // 🔑 Возвращаем Py<PyList> (Send тип)
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let model_class_bound = model_class_py.bind(py);
                 let list = PyList::empty(py);
@@ -134,11 +130,9 @@ impl FuryDB {
                 for buffer in buffers {
                     let instance: Py<PyAny> =
                         create_py_model_instance(model_class_bound.clone(), &schema, &buffer)?;
-                    // Привязываем Py обратно к GIL для append
                     list.append(instance.bind(py))?;
                 }
 
-                // Конвертируем Bound<PyList> -> Py<PyAny>
                 Ok(list.into_any().unbind())
             })
         })
@@ -160,7 +154,6 @@ impl FuryDB {
                 .await
                 .map_err(fury_error_to_pyerr)?;
 
-            // 🔑 Возвращаем Py<PyInt> (Send тип)
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let len = rows.len();
                 let py_int = len.into_pyobject(py)?;

@@ -10,7 +10,7 @@ pub use super::field::FieldType;
 /// concurrent read access with exclusive write access.
 #[derive(Clone, Default)]
 pub struct SchemaRegistry {
-    inner: Arc<RwLock<HashMap<String, ModelSchema>>>,
+    inner: Arc<RwLock<HashMap<String, Arc<ModelSchema>>>>,
 }
 
 impl SchemaRegistry {
@@ -25,12 +25,12 @@ impl SchemaRegistry {
     /// If a schema with the same name already exists, it will be replaced.
     pub fn register(&self, schema: ModelSchema) {
         let mut map = self.inner.write();
-        map.insert(schema.name.clone(), schema);
+        map.insert(schema.name.clone(), Arc::from(schema));
     }
 
     /// Retrieves a model schema by name.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<ModelSchema> {
+    pub fn get(&self, name: &str) -> Option<Arc<ModelSchema>> {
         let map = self.inner.read();
         map.get(name).cloned()
     }
@@ -43,7 +43,7 @@ impl SchemaRegistry {
     }
 
     /// Removes a schema by name and returns it if found.
-    pub fn remove(&self, name: &str) -> Option<ModelSchema> {
+    pub fn remove(&self, name: &str) -> Option<Arc<ModelSchema>> {
         let mut map = self.inner.write();
         map.remove(name)
     }
@@ -63,6 +63,7 @@ impl SchemaRegistry {
     }
 
     /// Returns a list of all registered model names.
+    #[must_use]
     pub fn list_models(&self) -> Vec<String> {
         let map = self.inner.read();
         map.keys().cloned().collect()

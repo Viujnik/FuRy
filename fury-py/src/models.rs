@@ -15,7 +15,6 @@ pub struct BaseModel {
     model_name: Option<String>,
 }
 
-// Ручная реализация Debug, т.к. FlatBufferBuilder не Debug
 impl std::fmt::Debug for BaseModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BaseModel")
@@ -73,7 +72,6 @@ impl BaseModel {
         Ok(())
     }
 
-    /// Возвращает бинарный буфер
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let buffer = self
             .buffer
@@ -82,7 +80,6 @@ impl BaseModel {
         Ok(PyBytes::new(py, buffer))
     }
 
-    /// Ленивое чтение полей
     fn __getattr__(&self, name: &str, py: Python) -> PyResult<Py<PyAny>> {
         let field_bytes = self.fields.get(name).ok_or_else(|| {
             pyo3::exceptions::PyAttributeError::new_err(format!("Field '{}' not found", name))
@@ -123,7 +120,6 @@ pub fn create_py_model_instance(
 ) -> PyResult<Py<PyAny>> {
     let instance = model_class.call0()?;
 
-    // Собираем байты полей в HashMap
     let mut fields_map = HashMap::new();
     for field in schema.fields() {
         if let Some(bytes) = builder.get_field_bytes(field.name()) {
@@ -131,7 +127,6 @@ pub fn create_py_model_instance(
         }
     }
 
-    // Получаем финальные байты буфера
     let buffer_bytes = builder
         .as_bytes()
         .map_err(|e| {
@@ -139,7 +134,6 @@ pub fn create_py_model_instance(
         })?
         .to_vec();
 
-    // Устанавливаем буфер через обычный Rust метод
     let mut base_model: PyRefMut<BaseModel> = instance.extract()?;
     base_model.set_buffer(buffer_bytes, fields_map, schema.name().to_string());
     drop(base_model);

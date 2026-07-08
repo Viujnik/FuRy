@@ -1,8 +1,8 @@
-use std::collections::HashMap;
-
 use crate::encoder::value::ValueType;
 use crate::error::{FuryError, Result};
 use crate::schema::registry::ModelSchema;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A high-performance binary record with a dynamic schema.
 ///
@@ -16,7 +16,7 @@ use crate::schema::registry::ModelSchema;
 /// ```
 
 pub struct BinaryRecord {
-    schema: ModelSchema,
+    schema: Arc<ModelSchema>,
     buffer: Vec<u8>,
     // Mapping from field name to its exact coordinates: (start_offset, length)
     offsets: HashMap<String, (usize, usize)>,
@@ -26,7 +26,7 @@ pub struct BinaryRecord {
 impl BinaryRecord {
     /// Creates a new empty record with a pre-allocated memory buffer based on the schema.
     #[must_use]
-    pub fn new(schema: ModelSchema) -> Self {
+    pub fn new(schema: Arc<ModelSchema>) -> Self {
         let fields_count = schema.fields_count();
         let estimated_size = 4 + schema
             .fields()
@@ -145,7 +145,7 @@ impl BinaryRecord {
     }
 
     #[must_use]
-    pub fn schema(&self) -> &ModelSchema {
+    pub fn schema(&self) -> &Arc<ModelSchema> {
         &self.schema
     }
 
