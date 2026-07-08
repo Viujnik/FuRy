@@ -3,10 +3,46 @@ use uuid::Uuid;
 
 use crate::schema::field::FieldType;
 
+/// Null marker for optional fields.
 const FLAG_NONE: u8 = 0x00;
-const FLAG_SOME: u8 = 0x01;
-const MAX_DEPTH: usize = 64;
 
+/// Value-present marker for optional fields.
+const FLAG_SOME: u8 = 0x01;
+
+/// Maximum recursion depth for nested types (List, Map, Object).
+/// Prevents stack overflow from malicious or deeply nested data.
+const MAX_DEPTH: usize = 16;
+
+/// Unix epoch (1970-01-01) as a compile-time constant.
+const UNIX_EPOCH: NaiveDate = match NaiveDate::from_ymd_opt(1970, 1, 1) {
+    Some(date) => date,
+    None => unreachable!(),
+};
+
+/// Writes a primitive value (flag + fixed-size data) to the buffer.
+macro_rules! write_primitive {
+    ($buf:expr, $value:expr) => {{
+        $buf.push(FLAG_SOME);
+        $buf.extend_from_slice(&$value.to_le_bytes());
+    }};
+}
+
+/// A dynamically-typed value that can be serialized to/from binary format.
+///
+/// Supports primitive types (integers, floats, bool), strings, bytes,
+/// dates, UUIDs, and nested collections (List, Map, Object).
+///
+/// # Binary Format
+///
+/// Each value is prefixed with a flag byte:
+/// - `0x00` (FLAG_NONE) — null value
+/// - `0x01` (FLAG_SOME) — value present, followed by type-specific data
+///
+/// # Zero-Copy Access
+///
+/// When stored in `BinaryRecord`, field bytes can be accessed directly
+/// via `get_field_bytes()` without deserialization, enabling ultra-fast
+/// read operations for cases where only raw bytes are needed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ValueType {
     None,
@@ -32,15 +68,20 @@ pub enum ValueType {
 }
 
 impl ValueType {
+    /// Calculates the exact byte size of this value when serialized.
+    ///
+    /// This is used for buffer pre-allocation to avoid reallocations.
     #[must_use]
     pub fn size(&self) -> usize {
         match self {
+            // do not forget about 1 byte for the flag
             Self::None => 1,
             Self::Int8(_) | Self::UInt8(_) | Self::Bool(_) => 2,
             Self::Int16(_) | Self::UInt16(_) => 3,
             Self::Int32(_) | Self::UInt32(_) | Self::Float32(_) | Self::Date(_) => 5,
             Self::Int64(_) | Self::UInt64(_) | Self::Float64(_) | Self::DateTime(_) => 9,
             Self::Uuid(_) => 17,
+            // and 4 bytes for the length info
             Self::String(s) => 5 + s.as_bytes().len(),
             Self::Bytes(b) => 5 + b.len(),
             Self::List(items) => 5 + items.iter().map(|item| item.size()).sum::<usize>(),
@@ -53,6 +94,10 @@ impl ValueType {
             Self::Object(buffer) => 5 + buffer.len(),
         }
     }
+    /// Serializes this value into a new byte vector.
+    ///
+    /// This is a convenience method that allocates a new vector.
+    /// For better performance, use `write_to()` with a pre-allocated buffer.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(self.size());
@@ -60,49 +105,23 @@ impl ValueType {
         buf
     }
 
+    /// Serializes this value into the provided buffer.
+    ///
+    /// This method appends bytes to the buffer without allocating a new vector.
+    /// Used internally by `BinaryRecord` for zero-copy serialization.
     pub(crate) fn write_to(&self, buf: &mut Vec<u8>) {
         match self {
             Self::None => buf.push(FLAG_NONE),
-            Self::Int8(v) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::UInt8(v) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::Int16(v) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::UInt16(v) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::Int32(v) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::UInt32(v) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::Float32(v) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::Int64(v) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::UInt64(v) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            Self::Float64(v) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
+            Self::Int8(v) => write_primitive!(buf, v),
+            Self::UInt8(v) => write_primitive!(buf, v),
+            Self::Int16(v) => write_primitive!(buf, v),
+            Self::UInt16(v) => write_primitive!(buf, v),
+            Self::Int32(v) => write_primitive!(buf, v),
+            Self::UInt32(v) => write_primitive!(buf, v),
+            Self::Float32(v) => write_primitive!(buf, v),
+            Self::Int64(v) => write_primitive!(buf, v),
+            Self::UInt64(v) => write_primitive!(buf, v),
+            Self::Float64(v) => write_primitive!(buf, v),
             Self::Bool(v) => {
                 buf.push(FLAG_SOME);
                 buf.push(u8::from(*v));
@@ -113,8 +132,7 @@ impl ValueType {
             }
             Self::Date(d) => {
                 buf.push(FLAG_SOME);
-                let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                let days = (*d - epoch).num_days() as i32;
+                let days = (*d - UNIX_EPOCH).num_days() as i32;
                 buf.extend_from_slice(&days.to_le_bytes());
             }
             Self::Uuid(u) => {
@@ -155,10 +173,31 @@ impl ValueType {
         }
     }
 
+    /// Deserializes a value from raw bytes according to the expected field type.
+    ///
+    /// Returns `None` if the bytes are corrupted or don't match the expected type.
+    ///
+    /// This is a convenience wrapper around `from_bytes_with_rest()` that discards
+    /// the remaining bytes.
     pub fn from_bytes(bytes: &[u8], field_type: &FieldType) -> Option<Self> {
         Self::from_bytes_with_rest(bytes, field_type, 0).map(|(value, _rest)| value)
     }
 
+    /// Deserializes a value and returns the remaining bytes.
+    ///
+    /// This is useful for parsing multiple values from a single byte slice
+    /// without copying or reallocating.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` — raw byte slice to parse
+    /// * `field_type` — expected type of the value
+    /// * `depth` — current recursion depth (prevents stack overflow)
+    ///
+    /// # Returns
+    ///
+    /// * `Some((value, remaining_bytes))` if successful
+    /// * `None` if parsing fails or max depth exceeded
     pub fn from_bytes_with_rest<'a>(
         bytes: &'a [u8],
         field_type: &FieldType,
@@ -298,6 +337,7 @@ impl ValueType {
         }
     }
 
+    /// Returns `true` if this value is `None`.
     #[must_use]
     pub const fn is_none(&self) -> bool {
         matches!(self, Self::None)
