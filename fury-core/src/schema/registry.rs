@@ -4,157 +4,154 @@ use std::sync::Arc;
 
 pub use super::field::FieldType;
 
+/// Global registry for model schemas.
+///
+/// Thread-safe storage for all registered models. Uses `Arc<RwLock<>>` for
+/// concurrent read access with exclusive write access.
 #[derive(Clone, Default)]
 pub struct SchemaRegistry {
-    inner: Arc<RwLock<HashMap<Arc<str>, ModelSchema>>>,
+    inner: Arc<RwLock<HashMap<String, ModelSchema>>>,
 }
 
 impl SchemaRegistry {
+    /// Creates a new empty schema registry.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Registers a new model schema.
+    ///
+    /// If a schema with the same name already exists, it will be replaced.
     pub fn register(&self, schema: ModelSchema) {
         let mut map = self.inner.write();
         map.insert(schema.name.clone(), schema);
     }
 
+    /// Retrieves a model schema by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<ModelSchema> {
         let map = self.inner.read();
         map.get(name).cloned()
     }
 
+    /// Checks if a schema with the given name exists.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
         let map = self.inner.read();
         map.contains_key(name)
     }
 
+    /// Removes a schema by name and returns it if found.
     pub fn remove(&self, name: &str) -> Option<ModelSchema> {
         let mut map = self.inner.write();
         map.remove(name)
     }
 
+    /// Returns the number of registered schemas.
     #[must_use]
     pub fn len(&self) -> usize {
         let map = self.inner.read();
         map.len()
     }
 
+    /// Returns `true` if no schemas are registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         let map = self.inner.read();
         map.is_empty()
     }
 
-    #[must_use]
-    pub fn list_models(&self) -> Vec<Arc<str>> {
+    /// Returns a list of all registered model names.
+    pub fn list_models(&self) -> Vec<String> {
         let map = self.inner.read();
-        let mut result = Vec::with_capacity(map.len());
-        result.extend(map.keys().cloned());
-        result
+        map.keys().cloned().collect()
     }
 }
 
+/// Schema definition for a model.
+///
+/// Contains the model name, field definitions, and a pre-computed index
+/// for fast field lookup by name.
 #[derive(Clone, Debug)]
 pub struct ModelSchema {
-    name: Arc<str>,
+    name: String,
     fields: Vec<FieldSchema>,
-    field_index: Arc<RwLock<HashMap<Arc<str>, usize>>>,
-}
-
-impl PartialEq for ModelSchema {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.fields == other.fields
-    }
+    field_index: HashMap<String, usize>,
 }
 
 impl ModelSchema {
+    /// Creates a new model schema with the given name and fields.
+    ///
+    /// The field index is built immediately for fast lookup.
     #[must_use]
-    pub fn new(name: impl Into<Arc<str>>, fields: Vec<FieldSchema>) -> Self {
+    pub fn new(name: impl Into<String>, fields: Vec<FieldSchema>) -> Self {
+        let field_index = Self::build_field_index(&fields);
         Self {
             name: name.into(),
             fields,
-            field_index: Arc::new(RwLock::new(HashMap::new())),
+            field_index,
         }
     }
 
+    /// Returns the model name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Returns a slice of all fields.
     #[must_use]
     pub fn fields(&self) -> &[FieldSchema] {
         &self.fields
     }
 
+    /// Returns the number of fields.
     #[must_use]
     pub fn fields_count(&self) -> usize {
         self.fields.len()
     }
 
+    /// Finds a field by name.
+    ///
+    /// Returns `None` if the field does not exist.
     #[must_use]
     pub fn find_field(&self, name: &str) -> Option<&FieldSchema> {
-        {
-            let index = self.field_index.read();
-            if let Some(&idx) = index.get(name) {
-                return self.fields.get(idx);
-            }
-        }
-
-        let mut index = self.field_index.write();
-        if index.is_empty() && !self.fields.is_empty() {
-            *index = Self::build_field_index(&self.fields);
-            if let Some(&idx) = index.get(name) {
-                return self.fields.get(idx);
-            }
-        }
-
-        None
+        let idx = self.field_index.get(name)?;
+        self.fields.get(*idx)
     }
 
+    /// Returns the index of a field by name.
+    ///
+    /// Returns `None` if the field does not exist.
     #[must_use]
     pub fn field_index(&self, name: &str) -> Option<usize> {
-        {
-            let index = self.field_index.read();
-            if let Some(&idx) = index.get(name) {
-                return Some(idx);
-            }
-        }
-
-        let mut index = self.field_index.write();
-        if index.is_empty() && !self.fields.is_empty() {
-            *index = Self::build_field_index(&self.fields);
-            if let Some(&idx) = index.get(name) {
-                return Some(idx);
-            }
-        }
-
-        None
+        self.field_index.get(name).copied()
     }
 
-    fn build_field_index(fields: &[FieldSchema]) -> HashMap<Arc<str>, usize> {
+    // Helper function to eagerly compile a fast O(1) field lookup index.
+    // Called once inside the constructor during ModelSchema initialization.
+    fn build_field_index(fields: &[FieldSchema]) -> HashMap<String, usize> {
         let mut index = HashMap::with_capacity(fields.len());
         for (i, field) in fields.iter().enumerate() {
-            index.insert(field.name.clone(), i);
+            index.insert(field.name().to_string(), i);
         }
         index
     }
 }
 
+/// Schema definition for a single field.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldSchema {
-    name: Arc<str>,
+    name: String,
     field_type: FieldType,
     nullable: bool,
 }
 
 impl FieldSchema {
+    /// Creates a new field schema.
     #[must_use]
-    pub fn new(name: impl Into<Arc<str>>, field_type: FieldType, nullable: bool) -> Self {
+    pub fn new(name: impl Into<String>, field_type: FieldType, nullable: bool) -> Self {
         Self {
             name: name.into(),
             field_type,
@@ -162,18 +159,32 @@ impl FieldSchema {
         }
     }
 
+    /// Returns `true` if the field is nullable.
     #[must_use]
     pub const fn is_nullable(&self) -> bool {
         self.nullable
     }
 
+    /// Returns the field name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Returns the field type.
     #[must_use]
     pub fn field_type(&self) -> &FieldType {
         &self.field_type
+    }
+}
+
+impl PartialEq for ModelSchema {
+    /// Determines equality between two model schemas.
+    ///
+    /// # Implementation Details
+    ///
+    /// Two schemas are considered equal if their names and ordered field sequences are identical.
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.fields == other.fields
     }
 }

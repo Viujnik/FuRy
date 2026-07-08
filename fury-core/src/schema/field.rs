@@ -1,5 +1,9 @@
 use std::fmt;
 
+/// Supported database field data types inside the FuRy serialization engine.
+///
+/// Handles primitive scalars, fixed-size temporal types, and recursive complex
+/// structures like lists, maps, and nested database objects.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FieldType {
     Int8,
@@ -24,6 +28,19 @@ pub enum FieldType {
 }
 
 impl FieldType {
+    /// Returns the data footprint size in bytes for fixed-length data types.
+    ///
+    /// Returns `Some(usize)` for types with known size at compile time,
+    /// or `None` for variable-length types.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fury_core::schema::field::FieldType;
+    ///
+    /// assert_eq!(FieldType::Int32.fixed_size(), Some(4));
+    /// assert_eq!(FieldType::String.fixed_size(), None);
+    /// ```
     #[must_use]
     pub fn fixed_size(&self) -> Option<usize> {
         match self {
@@ -37,44 +54,55 @@ impl FieldType {
         }
     }
 
+    /// Returns `true` if this type is a collection (List, Map, or Object).
+    ///
+    /// Note: All collections are also variable-length types.
     #[must_use]
     pub fn is_collection(&self) -> bool {
         matches!(self, Self::List(_) | Self::Map(_, _) | Self::Object(_))
     }
 
+    /// Returns `true` if this type has variable length at runtime.
+    ///
+    /// This includes all collections plus String and Bytes.
     #[must_use]
     pub fn is_variable_length(&self) -> bool {
-        matches!(
-            self,
-            Self::String | Self::Bytes | Self::List(_) | Self::Map(_, _) | Self::Object(_)
-        )
+        self.is_collection() || matches!(self, Self::String | Self::Bytes)
     }
 
+    /// Returns the type name as a static string slice.
+    ///
+    /// This is a zero-allocation operation suitable for logging and debugging.
     #[must_use]
-    pub fn as_str(&self) -> String {
+    pub const fn as_str(&self) -> &'static str {
         match self {
-            Self::Int8 => "Int8".to_string(),
-            Self::Int16 => "Int16".to_string(),
-            Self::Int32 => "Int32".to_string(),
-            Self::Int64 => "Int64".to_string(),
-            Self::UInt8 => "UInt8".to_string(),
-            Self::UInt16 => "UInt16".to_string(),
-            Self::UInt32 => "UInt32".to_string(),
-            Self::UInt64 => "UInt64".to_string(),
-            Self::Float32 => "Float32".to_string(),
-            Self::Float64 => "Float64".to_string(),
-            Self::Bool => "Bool".to_string(),
-            Self::String => "String".to_string(),
-            Self::Bytes => "Bytes".to_string(),
-            Self::DateTime => "DateTime".to_string(),
-            Self::Date => "Date".to_string(),
-            Self::Uuid => "Uuid".to_string(),
-            Self::List(inner) => format!("List<{}>", inner.as_str()),
-            Self::Map(key, value) => format!("Map<{}, {}>", key.as_str(), value.as_str()),
-            Self::Object(name) => format!("Object({})", name),
+            Self::Int8 => "Int8",
+            Self::Int16 => "Int16",
+            Self::Int32 => "Int32",
+            Self::Int64 => "Int64",
+            Self::UInt8 => "UInt8",
+            Self::UInt16 => "UInt16",
+            Self::UInt32 => "UInt32",
+            Self::UInt64 => "UInt64",
+            Self::Float32 => "Float32",
+            Self::Float64 => "Float64",
+            Self::String => "String",
+            Self::Bytes => "Bytes",
+            Self::Bool => "Bool",
+            Self::Date => "Date",
+            Self::DateTime => "DateTime",
+            Self::Uuid => "Uuid",
+            Self::List(_) => "List",
+            Self::Map(_, _) => "Map",
+            Self::Object(_) => "Object",
         }
     }
 
+    /// Computes the maximum nested depth level of recursive complex collections.
+    ///
+    /// * Primitive scalars return `0`.
+    /// * Simple lists or flat objects return `1`.
+    /// * Highly nested deep matrix layouts increment proportionally based on allocation branches.
     #[must_use]
     pub fn field_depth(&self) -> usize {
         match self {
@@ -87,7 +115,17 @@ impl FieldType {
 }
 
 impl fmt::Display for FieldType {
+    /// Formats the data type into an expressive human-readable string representation.
+    ///
+    /// Primitives are printed using lightning-fast `as_str()` compilation lookups,
+    /// while recursive structures deep-dive to dynamically unwrap their internal types
+    /// without a single memory allocation.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
+        match self {
+            Self::List(inner) => write!(f, "List<{inner}>"),
+            Self::Map(key, val) => write!(f, "Map<{key}, {val}>"),
+
+            _ => f.write_str(self.as_str()),
+        }
     }
 }
