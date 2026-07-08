@@ -36,9 +36,7 @@ impl FuryDB {
         let registry = get_global_registry().clone();
         let executor = Arc::new(QueryExecutor::new(pool.clone(), registry));
 
-        Ok(Self {
-            executor,
-        })
+        Ok(Self { executor })
     }
 
     #[pyo3(name = "fetch_one")]

@@ -1,19 +1,30 @@
-use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::encoder::value::ValueType;
 use crate::error::{FuryError, Result};
 use crate::schema::registry::ModelSchema;
 
-pub struct FlatBufferBuilder {
+/// A high-performance binary record with a dynamic schema.
+///
+/// Stores fields sequentially in a flat byte array, providing ultra-fast,
+/// zero-copy field access by calculating boundaries during serialization.
+///
+/// # Format of buffer
+///
+/// ```text
+/// [4 bytes: header (total size)][field1_data][field2_data]...
+/// ```
+
+pub struct BinaryRecord {
     schema: ModelSchema,
     buffer: Vec<u8>,
-    offsets: Arc<RwLock<HashMap<Arc<str>, usize>>>,
+    // Mapping from field name to its exact coordinates: (start_offset, length)
+    offsets: HashMap<String, (usize, usize)>,
     is_finished: bool,
 }
 
-impl FlatBufferBuilder {
+impl BinaryRecord {
+    /// Creates a new empty record with a pre-allocated memory buffer based on the schema.
     #[must_use]
     pub fn new(schema: ModelSchema) -> Self {
         let fields_count = schema.fields_count();
@@ -31,12 +42,22 @@ impl FlatBufferBuilder {
         Self {
             schema,
             buffer,
-            offsets: Arc::new(RwLock::new(HashMap::with_capacity(fields_count))),
+            offsets: HashMap::with_capacity(fields_count),
             is_finished: false,
         }
     }
 
+    /// Serializes and appends a field value to the record buffer.
+    ///
+    /// # Errors
+    ///
+    /// * `FuryError::BufferAlreadyFinished` - If `finish()` has already been called on this record.
+    /// * `FuryError::FieldNotFound` - If the requested field name does not exist in the model schema.
     pub fn set_field(&mut self, name: &str, value: ValueType) -> Result<()> {
+        if self.is_finished {
+            return Err(FuryError::BufferAlreadyFinished);
+        }
+
         let field = self
             .schema
             .find_field(name)
@@ -45,26 +66,36 @@ impl FlatBufferBuilder {
                 schema: self.schema.name().into(),
             })?;
 
-        let offset = self.buffer.len();
+        let start_offset = self.buffer.len();
         value.write_to(&mut self.buffer);
 
-        let mut offsets = self.offsets.write();
-        offsets.insert(Arc::from(field.name()), offset);
+        let field_len = self.buffer.len() - start_offset;
+        self.offsets
+            .insert(field.name().to_string(), (start_offset, field_len));
 
         Ok(())
     }
 
+    /// Returns a direct slice of raw bytes corresponding to the given field name.
+    ///
+    /// This operation is strictly $O(1)$ and executes without any memory allocations or data copying.
+    ///
+    /// Returns `Some(&[u8])` containing the raw field bytes if the field exists and has been
+    /// serialized, or `None` if the field name is not found in the record's offsets.
     #[must_use]
     pub fn get_field_bytes(&self, name: &str) -> Option<&[u8]> {
-        let offsets = self.offsets.read();
-        let &offset = offsets.get(name)?;
+        let &(offset, len) = self.offsets.get(name)?;
 
-        let next_offset = offsets.values().copied().filter(|&off| off > offset).min();
-        let end = next_offset.unwrap_or_else(|| self.buffer.len());
-
-        self.buffer.get(offset..end)
+        self.buffer.get(offset..(offset + len))
     }
 
+    /// Retrieves and parses a field's raw bytes back into its typed `ValueType` representation.
+    ///
+    /// Returns `Some(ValueType)` if the field is found and its binary payload is successfully
+    /// deserialized into a valid system type.
+    ///
+    /// Returns `None` if the field name does not exist in the record, or if the raw byte
+    /// sequence is corrupted and fails the type verification layout.
     #[must_use]
     pub fn get_field_value(&self, name: &str) -> Option<ValueType> {
         let bytes = self.get_field_bytes(name)?;
@@ -72,6 +103,13 @@ impl FlatBufferBuilder {
         ValueType::from_bytes(bytes, &field.field_type())
     }
 
+    /// Retrieves and parses a field's raw bytes back into its typed `ValueType` representation.
+    ///
+    /// Returns `Some(ValueType)` if the field is found and its binary payload is successfully
+    /// deserialized into a valid system type.
+    ///
+    /// Returns `None` if the field name does not exist in the record, or if the raw byte
+    /// sequence is corrupted and fails the type verification layout.
     pub fn finish(&mut self) -> Result<&[u8]> {
         if self.is_finished {
             return Err(FuryError::BufferAlreadyFinished);
@@ -84,6 +122,11 @@ impl FlatBufferBuilder {
         Ok(&self.buffer)
     }
 
+    /// Returns the finalized raw byte payload of the entire record.
+    ///
+    /// # Errors
+    ///
+    /// * `FuryError::BufferNotFinished` - If called before freezing the record via `finish()`.
     pub fn as_bytes(&self) -> Result<&[u8]> {
         if !self.is_finished {
             return Err(FuryError::BufferNotFinished);

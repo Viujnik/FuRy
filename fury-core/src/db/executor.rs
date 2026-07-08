@@ -1,10 +1,10 @@
 use crate::db::pool::DatabasePool;
-use crate::encoder::buffer::FlatBufferBuilder;
+use crate::encoder::buffer::BinaryRecord;
 use crate::encoder::value::ValueType;
 use crate::error::{FuryError, Result};
 use crate::schema::registry::{FieldType, ModelSchema, SchemaRegistry};
 use sqlx::any::{AnyArguments, AnyRow};
-use sqlx::{Arguments, Row, query_with};
+use sqlx::{query_with, Arguments, Row};
 use std::sync::Arc;
 
 pub struct QueryExecutor {
@@ -39,8 +39,8 @@ impl QueryExecutor {
         Ok(rows)
     }
 
-    pub fn row_to_buffer(&self, row: &AnyRow, schema: &ModelSchema) -> Result<FlatBufferBuilder> {
-        let mut builder = FlatBufferBuilder::new(schema.clone());
+    pub fn row_to_buffer(&self, row: &AnyRow, schema: &ModelSchema) -> Result<BinaryRecord> {
+        let mut builder = BinaryRecord::new(schema.clone());
 
         for field in schema.fields() {
             let value = self.extract_value(row, &field.name(), &field.field_type())?;

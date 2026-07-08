@@ -1,5 +1,5 @@
 use chrono::{Datelike, Timelike};
-use fury_core::encoder::buffer::FlatBufferBuilder;
+use fury_core::encoder::buffer::BinaryRecord;
 use fury_core::encoder::value::ValueType;
 use fury_core::schema::registry::{FieldSchema, FieldType, ModelSchema};
 use pyo3::prelude::*;
@@ -75,9 +75,10 @@ impl BaseModel {
 
     /// Возвращает бинарный буфер
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let buffer = self.buffer.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Buffer not initialized")
-        })?;
+        let buffer = self
+            .buffer
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Buffer not initialized"))?;
         Ok(PyBytes::new(py, buffer))
     }
 
@@ -87,20 +88,25 @@ impl BaseModel {
             pyo3::exceptions::PyAttributeError::new_err(format!("Field '{}' not found", name))
         })?;
 
-        let model_name = self.model_name.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Model name not set")
-        })?;
+        let model_name = self
+            .model_name
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model name not set"))?;
 
         let schema = get_global_registry().get(model_name).ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Schema not found: {}", model_name))
         })?;
 
-        let field = schema.fields().iter().find(|f| f.name() == name).ok_or_else(|| {
-            pyo3::exceptions::PyAttributeError::new_err(format!(
-                "Field '{}' not found in schema",
-                name
-            ))
-        })?;
+        let field = schema
+            .fields()
+            .iter()
+            .find(|f| f.name() == name)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyAttributeError::new_err(format!(
+                    "Field '{}' not found in schema",
+                    name
+                ))
+            })?;
 
         let value = ValueType::from_bytes(field_bytes, field.field_type()).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!("Failed to parse field '{}'", name))
@@ -113,7 +119,7 @@ impl BaseModel {
 pub fn create_py_model_instance(
     model_class: Bound<'_, PyAny>,
     schema: &ModelSchema,
-    builder: &FlatBufferBuilder,
+    builder: &BinaryRecord,
 ) -> PyResult<Py<PyAny>> {
     let instance = model_class.call0()?;
 
@@ -126,9 +132,12 @@ pub fn create_py_model_instance(
     }
 
     // Получаем финальные байты буфера
-    let buffer_bytes = builder.as_bytes().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get buffer bytes: {}", e))
-    })?.to_vec();
+    let buffer_bytes = builder
+        .as_bytes()
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get buffer bytes: {}", e))
+        })?
+        .to_vec();
 
     // Устанавливаем буфер через обычный Rust метод
     let mut base_model: PyRefMut<BaseModel> = instance.extract()?;

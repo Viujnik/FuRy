@@ -7,7 +7,7 @@ mod errors;
 mod models;
 
 use db::FuryDB;
-use fury_core::schema::registry::SchemaRegistry;  // ✅ Один импорт
+use fury_core::schema::registry::SchemaRegistry; // ✅ Один импорт
 use models::BaseModel;
 
 static GLOBAL_REGISTRY: OnceLock<SchemaRegistry> = OnceLock::new();
