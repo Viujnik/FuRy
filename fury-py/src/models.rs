@@ -1,3 +1,5 @@
+use crate::errors::fury_error_to_pyerr;
+use crate::get_global_registry;
 use chrono::{Datelike, Timelike};
 use fury_core::encoder::buffer::BinaryRecord;
 use fury_core::encoder::value::ValueType;
@@ -5,50 +7,56 @@ use fury_core::schema::registry::{FieldSchema, FieldType, ModelSchema};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyType};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::OnceLock;
 
-use crate::get_global_registry;
+/// Cached reference to Python's `datetime.date` class for fast instantiation.
+static DATE_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
 
+/// Cached reference to Python's `datetime.datetime` class for fast instantiation.
+static DATETIME_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// Base model layout for FuRy high-performance binary serialization.
+///
+/// Wraps sequential binary record payloads and provides direct, zero-copy field
+/// access by mapping lookups into pre-calculated boundaries.
 #[pyclass(subclass, skip_from_py_object)]
 pub struct BaseModel {
-    buffer: Option<Vec<u8>>,
-    fields: HashMap<String, Vec<u8>>,
-    model_name: Option<String>,
-}
-
-impl std::fmt::Debug for BaseModel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BaseModel")
-            .field("model_name", &self.model_name)
-            .field("buffer_len", &self.buffer.as_ref().map(|b| b.len()))
-            .field("fields_count", &self.fields.len())
-            .finish()
-    }
+    buffer: Vec<u8>,
+    field_offsets: HashMap<String, (usize, usize)>,
+    schema: Arc<ModelSchema>,
 }
 
 impl BaseModel {
-    pub fn set_buffer(
+    /// Eagerly injects underlying record byte buffers and compiled offset metadata map layouts.
+    pub fn set_data(
         &mut self,
-        bytes: Vec<u8>,
-        fields: HashMap<String, Vec<u8>>,
-        model_name: String,
+        buffer: Vec<u8>,
+        field_offsets: HashMap<String, (usize, usize)>,
+        schema: Arc<ModelSchema>,
     ) {
-        self.buffer = Some(bytes);
-        self.fields = fields;
-        self.model_name = Some(model_name);
+        self.buffer = buffer;
+        self.field_offsets = field_offsets;
+        self.schema = schema;
     }
 }
 
 #[pymethods]
 impl BaseModel {
+    /// Creates a new empty BaseModel instance.
     #[new]
     fn new() -> Self {
         Self {
-            buffer: None,
-            fields: HashMap::new(),
-            model_name: None,
+            buffer: Vec::new(),
+            field_offsets: HashMap::new(),
+            schema: Arc::new(ModelSchema::new("Unknown", vec![])),
         }
     }
 
+    /// Registers the model schema when a subclass is defined.
+    ///
+    /// This is called automatically by Python when a class inherits from BaseModel.
+    /// It extracts type annotations and registers the schema in the global registry.
     #[classmethod]
     fn __init_subclass__(_cls: Bound<'_, PyType>) -> PyResult<()> {
         let name: String = _cls.getattr("__name__")?.extract()?;
@@ -72,75 +80,87 @@ impl BaseModel {
         Ok(())
     }
 
+    /// Returns the raw binary buffer as Python bytes.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let buffer = self
-            .buffer
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Buffer not initialized"))?;
-        Ok(PyBytes::new(py, buffer))
+        if self.buffer.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Buffer is uninitialized",
+            ));
+        }
+        Ok(PyBytes::new(py, &self.buffer))
     }
 
-    fn __getattr__(&self, name: &str, py: Python) -> PyResult<Py<PyAny>> {
-        let field_bytes = self.fields.get(name).ok_or_else(|| {
-            pyo3::exceptions::PyAttributeError::new_err(format!("Field '{}' not found", name))
+    /// Gets a field value by name with zero-copy buffer access.
+    ///
+    /// This is called automatically when accessing attributes on the model.
+    /// It performs O(1) lookup in field_offsets and schema for maximum performance.
+    fn __getattr__(&self, name: &str, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let &(offset, len) = self.field_offsets.get(name).ok_or_else(|| {
+            pyo3::exceptions::PyAttributeError::new_err(format!("Field '{name}' not found"))
         })?;
 
-        let model_name = self
-            .model_name
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Model name not set"))?;
-
-        let schema = get_global_registry().get(model_name).ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Schema not found: {}", model_name))
+        let field = self.schema.find_field(name).ok_or_else(|| {
+            pyo3::exceptions::PyAttributeError::new_err(format!(
+                "Field '{name}' not found in schema"
+            ))
         })?;
 
-        let field = schema
-            .fields()
-            .iter()
-            .find(|f| f.name() == name)
-            .ok_or_else(|| {
-                pyo3::exceptions::PyAttributeError::new_err(format!(
-                    "Field '{}' not found in schema",
-                    name
-                ))
-            })?;
+        let field_bytes = &self.buffer[offset..(offset + len)];
 
         let value = ValueType::from_bytes(field_bytes, field.field_type()).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!("Failed to parse field '{}'", name))
+            pyo3::exceptions::PyValueError::new_err(format!("Failed to parse field '{name}'"))
         })?;
 
         value_to_python(py, &value)
     }
 }
 
+impl std::fmt::Debug for BaseModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BaseModel")
+            .field("schema_name", &self.schema.name())
+            .field("buffer_len", &self.buffer.len())
+            .field("fields_count", &self.field_offsets.len())
+            .finish()
+    }
+}
+
+/// Creates a Python model instance from a binary record.
+///
+/// Extracts field offsets (NOT copies!) from the buffer and initializes
+/// the BaseModel with zero-copy access to the data.
+/// The schema is shared via Arc, avoiding duplication across instances.
 pub fn create_py_model_instance(
     model_class: Bound<'_, PyAny>,
-    schema: &ModelSchema,
+    schema: &Arc<ModelSchema>,
     builder: &BinaryRecord,
 ) -> PyResult<Py<PyAny>> {
     let instance = model_class.call0()?;
 
-    let mut fields_map = HashMap::new();
+    let mut field_offsets = HashMap::with_capacity(schema.fields_count());
+
     for field in schema.fields() {
-        if let Some(bytes) = builder.get_field_bytes(field.name()) {
-            fields_map.insert(field.name().to_string(), bytes.to_vec());
+        if let Some((offset, length)) = builder.get_field_offset(field.name()) {
+            field_offsets.insert(field.name().to_owned(), (offset, length));
         }
     }
 
-    let buffer_bytes = builder
-        .as_bytes()
-        .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get buffer bytes: {}", e))
-        })?
-        .to_vec();
+    let buffer_bytes = builder.as_bytes().map_err(fury_error_to_pyerr)?.to_vec();
 
     let mut base_model: PyRefMut<BaseModel> = instance.extract()?;
-    base_model.set_buffer(buffer_bytes, fields_map, schema.name().to_string());
+    base_model.set_data(buffer_bytes, field_offsets, Arc::clone(schema));
     drop(base_model);
 
     Ok(instance.unbind())
 }
 
+/// Converts a Python type annotation to a FuRy FieldType.
+///
+/// Supports: int, str, bool, float, bytes.
+///
+/// # Errors
+///
+/// Returns `TypeError` if the Python type is not supported.
 fn python_type_to_field_type(py_type: Bound<'_, PyAny>) -> PyResult<FieldType> {
     let type_name: String = py_type.getattr("__name__")?.extract()?;
     match type_name.as_str() {
@@ -156,6 +176,36 @@ fn python_type_to_field_type(py_type: Bound<'_, PyAny>) -> PyResult<FieldType> {
     }
 }
 
+/// Global atomic cache container holding a pointer-assigned reference to the CPython `datetime.date` class metadata layout.
+///
+/// Thread-safe and initialized exactly once upon the first processed date field retrieval.
+fn get_date_cls(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    let cls = DATE_CLS.get_or_init(|| {
+        py.import("datetime")
+            .and_then(|m| m.getattr("date"))
+            .map(|c| c.unbind())
+            .expect("datetime module must be available")
+    });
+    Ok(cls.bind(py))
+}
+
+/// Global atomic cache container holding a pointer-assigned reference to the CPython `datetime.date` class metadata layout.
+///
+/// Thread-safe and initialized exactly once upon the first processed date field retrieval.
+fn get_datetime_cls(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    let cls = DATETIME_CLS.get_or_init(|| {
+        py.import("datetime")
+            .and_then(|m| m.getattr("datetime"))
+            .map(|c| c.unbind())
+            .expect("datetime.datetime module must be available")
+    });
+    Ok(cls.bind(py))
+}
+
+/// Converts a FuRy ValueType to a Python object.
+///
+/// Handles all supported types including primitives, strings, bytes,
+/// dates, UUIDs, and nested collections.
 fn value_to_python(py: Python<'_>, value: &ValueType) -> PyResult<Py<PyAny>> {
     match value {
         ValueType::None => Ok(py.None()),
@@ -179,15 +229,11 @@ fn value_to_python(py: Python<'_>, value: &ValueType) -> PyResult<Py<PyAny>> {
         ValueType::Bytes(v) => Ok(PyBytes::new(py, v).into_any().unbind()),
 
         ValueType::Date(d) => {
-            let datetime_mod = py.import("datetime")?;
-            let date_cls = datetime_mod.getattr("date")?;
-            let py_date = date_cls.call1((d.year(), d.month(), d.day()))?;
+            let py_date = get_date_cls(py)?.call1((d.year(), d.month(), d.day()))?;
             Ok(py_date.unbind())
         }
         ValueType::DateTime(dt) => {
-            let datetime_mod = py.import("datetime")?;
-            let datetime_cls = datetime_mod.getattr("datetime")?;
-            let py_dt = datetime_cls.call1((
+            let py_dt = get_datetime_cls(py)?.call1((
                 dt.year(),
                 dt.month(),
                 dt.day(),
@@ -198,13 +244,13 @@ fn value_to_python(py: Python<'_>, value: &ValueType) -> PyResult<Py<PyAny>> {
             Ok(py_dt.unbind())
         }
         ValueType::Uuid(u) => Ok(u.to_string().into_pyobject(py)?.into_any().unbind()),
-
         ValueType::List(items) => {
-            let list = PyList::empty(py);
-            for item in items {
-                let py_item = value_to_python(py, item)?;
-                list.append(py_item.bind(py))?;
-            }
+            let py_items = items
+                .iter()
+                .map(|item| value_to_python(py, item))
+                .collect::<PyResult<Vec<_>>>()?;
+
+            let list = PyList::new(py, py_items)?;
             Ok(list.into_any().unbind())
         }
         ValueType::Map(entries) => {

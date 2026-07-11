@@ -103,6 +103,17 @@ impl BinaryRecord {
         ValueType::from_bytes(bytes, &field.field_type())
     }
 
+    /// Returns the byte coordinates of a field within the record buffer.
+    ///
+    /// Returns `Some((offset, length))` where:
+    /// - `offset` — starting byte position of the field in the buffer
+    /// - `length` — number of bytes occupied by the field
+    ///
+    /// Returns `None` if the field does not exist or has not been set.
+    pub fn get_field_offset(&self, name: &str) -> Option<(usize, usize)> {
+        self.offsets.get(name).copied()
+    }
+
     /// Retrieves and parses a field's raw bytes back into its typed `ValueType` representation.
     ///
     /// Returns `Some(ValueType)` if the field is found and its binary payload is successfully
