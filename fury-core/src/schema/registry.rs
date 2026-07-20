@@ -4,6 +4,17 @@ use std::sync::Arc;
 
 pub use super::field::FieldType;
 
+use std::sync::OnceLock;
+
+static GLOBAL_REGISTRY: OnceLock<SchemaRegistry> = OnceLock::new();
+
+/// Returns a read-only static reference to the shared compilation schema registry.
+///
+/// This is the single source of truth for all environment layers.
+pub fn get_global_registry() -> &'static SchemaRegistry {
+    GLOBAL_REGISTRY.get_or_init(SchemaRegistry::new)
+}
+
 /// Global registry for model schemas.
 ///
 /// Thread-safe storage for all registered models. Uses `Arc<RwLock<>>` for

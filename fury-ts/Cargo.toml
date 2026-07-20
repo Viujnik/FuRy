@@ -1,0 +1,10 @@
+[package]
+name = "fury-ts"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fury-core = { path = "../fury-core" }
+wasm-bindgen = "0.2.126"
+console_error_panic_hook = "0.1.7"
+js-sys = "0.3.103"

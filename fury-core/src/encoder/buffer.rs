@@ -145,6 +145,76 @@ impl BinaryRecord {
         Ok(&self.buffer)
     }
 
+    /// Compiles a `BinaryRecord` layout directly from a raw network byte stream.
+    ///
+    /// # Memory & Safety
+    ///
+    /// Performs strict frame boundary validation to prevent memory safety violations
+    /// or integer overflow attacks during dynamic slice assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `FuryError::InvalidSchema` if payload header constraints are broken.
+    pub fn from_raw_bytes(data: Vec<u8>, schema: &Arc<ModelSchema>) -> Result<Self> {
+        if data.len() < 4 {
+            return Err(FuryError::InvalidSchema(Box::from(
+                "Malformed packet stream: buffer size is below header requirements",
+            )));
+        }
+
+        let total_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() != total_size {
+            return Err(FuryError::InvalidSchema(Box::from(format!(
+                "Integrity mismatch: payload frame size ({}) deviates from header declaration ({})",
+                data.len(),
+                total_size
+            ))));
+        }
+
+        let mut offsets = HashMap::with_capacity(schema.fields_count());
+
+        let mut cursor = 4;
+
+        for field in schema.fields() {
+            if cursor + 8 > data.len() {
+                return Err(FuryError::InvalidSchema(Box::from(format!(
+                    "Unexpected EOB parsing boundaries for field '{}'",
+                    field.name()
+                ))));
+            }
+
+            let offset = u32::from_le_bytes([
+                data[cursor],
+                data[cursor + 1],
+                data[cursor + 2],
+                data[cursor + 3],
+            ]) as usize;
+            let length = u32::from_le_bytes([
+                data[cursor + 4],
+                data[cursor + 5],
+                data[cursor + 6],
+                data[cursor + 7],
+            ]) as usize;
+
+            if offset + length > data.len() {
+                return Err(FuryError::InvalidSchema(Box::from(format!(
+                    "Out-of-bounds pointer layout detected for field '{}'",
+                    field.name()
+                ))));
+            }
+
+            offsets.insert(field.name().to_owned(), (offset, length));
+            cursor += 8;
+        }
+
+        Ok(Self {
+            buffer: data,
+            offsets,
+            schema: Arc::clone(schema),
+            is_finished: true,
+        })
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.buffer.len()
