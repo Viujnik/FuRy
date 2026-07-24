@@ -4,7 +4,7 @@ members = [
     "fury-core",
     "fury-py",
     "fury-cli"
-, "fury-ts"]
+    , "fury-ts"]
 
 [workspace.dependencies]
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "any", "chrono", "uuid", "macros"] }

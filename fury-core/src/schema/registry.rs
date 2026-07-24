@@ -79,6 +79,12 @@ impl SchemaRegistry {
         let map = self.inner.read();
         map.keys().cloned().collect()
     }
+
+    /// Returns a vector of all registered model schemas as Arc pointers.
+    #[must_use]
+    pub fn get_all_schemas(&self) -> Vec<Arc<ModelSchema>> {
+        self.inner.read().values().cloned().collect()
+    }
 }
 
 /// Schema definition for a model.
