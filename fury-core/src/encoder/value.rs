@@ -128,7 +128,7 @@ impl ValueType {
             }
             Self::DateTime(dt) => {
                 buf.push(FLAG_SOME);
-                buf.extend_from_slice(&dt.and_utc().timestamp().to_le_bytes());
+                buf.extend_from_slice(&dt.and_utc().timestamp_micros().to_le_bytes());
             }
             Self::Date(d) => {
                 buf.push(FLAG_SOME);
@@ -271,7 +271,7 @@ impl ValueType {
             FieldType::DateTime => {
                 let (raw, rest) = data.split_at_checked(8)?;
                 let timestamp = i64::from_le_bytes(raw.try_into().ok()?);
-                let dt = DateTime::from_timestamp(timestamp, 0)?.naive_utc();
+                let dt = DateTime::from_timestamp_micros(timestamp)?.naive_utc();
                 Some((Self::DateTime(dt), rest))
             }
             FieldType::Date => {

@@ -5,7 +5,7 @@ use fury_core::encoder::buffer::BinaryRecord;
 use fury_core::encoder::value::ValueType;
 use fury_core::schema::registry::{FieldSchema, FieldType, ModelSchema};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyType};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -58,24 +58,53 @@ impl BaseModel {
     /// This is called automatically by Python when a class inherits from BaseModel.
     /// It extracts type annotations and registers the schema in the global registry.
     #[classmethod]
-    fn __init_subclass__(_cls: Bound<'_, PyType>) -> PyResult<()> {
+    #[pyo3(signature = (**_kwargs))]
+    fn __init_subclass__<'py>(
+        _cls: &Bound<'py, PyType>,
+        _kwargs: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<()> {
+        _cls.py();
         let name: String = _cls.getattr("__name__")?.extract()?;
 
-        let annotations: Bound<'_, PyDict> = match _cls.getattr("__annotations__") {
-            Ok(ann) => ann.cast_into::<PyDict>()?,
-            Err(_) => PyDict::new(_cls.py()),
-        };
-
-        let mut fields = Vec::with_capacity(annotations.len());
-
-        for (field_name, py_type) in annotations.iter() {
-            let field_name: String = field_name.extract()?;
-            let field_type = python_type_to_field_type(py_type.to_owned())?;
-            fields.push(FieldSchema::new(field_name, field_type, true));
+        if name == "BaseModel" || name == "FuryBaseModel" {
+            // Hardcored
+            return Ok(());
         }
 
-        let schema = ModelSchema::new(name, fields);
+        let mro_result: PyResult<Vec<Bound<'py, PyType>>> = _cls
+            .mro()
+            .iter()
+            .map(|x| x.cast_into::<PyType>().map_err(|e| e.into()))
+            .collect();
+
+        let mro: Vec<Bound<'py, PyType>> = mro_result?;
+
+        let mut ordered: Vec<(String, Bound<'py, PyAny>)> = Vec::new();
+        for base_class in mro.iter().rev() {
+            if let Ok(annotations_obj) = base_class.getattr("__annotations__") {
+                if let Ok(dict) = annotations_obj.cast::<PyDict>() {
+                    for (key, value) in dict.iter() {
+                        let k: String = key.extract()?;
+                        match ordered.iter_mut().find(|(name, _)| *name == k) {
+                            Some(slot) => slot.1 = value,
+                            None => ordered.push((k, value)),
+                        }
+                    }
+                }
+            }
+        }
+        let mut fields: Vec<FieldSchema> = Vec::with_capacity(ordered.len());
+        for (field_name, py_type) in ordered {
+            let (field_type, is_nullable) = parse_python_type(&py_type)?;
+            fields.push(FieldSchema::new(field_name, field_type, is_nullable));
+        }
+
+        let schema = ModelSchema::new(name.clone(), fields);
         get_global_registry().register(schema);
+
+        if std::env::var("FURY_EMIT_MODELS").is_ok() {
+            println!("__FURY_MODEL__:{name}");
+        }
 
         Ok(())
     }
@@ -154,28 +183,6 @@ pub fn create_py_model_instance(
     Ok(instance.unbind())
 }
 
-/// Converts a Python type annotation to a FuRy FieldType.
-///
-/// Supports: int, str, bool, float, bytes.
-///
-/// # Errors
-///
-/// Returns `TypeError` if the Python type is not supported.
-fn python_type_to_field_type(py_type: Bound<'_, PyAny>) -> PyResult<FieldType> {
-    let type_name: String = py_type.getattr("__name__")?.extract()?;
-    match type_name.as_str() {
-        "int" => Ok(FieldType::Int64),
-        "str" => Ok(FieldType::String),
-        "bool" => Ok(FieldType::Bool),
-        "float" => Ok(FieldType::Float64),
-        "bytes" => Ok(FieldType::Bytes),
-        _ => Err(pyo3::exceptions::PyTypeError::new_err(format!(
-            "Unsupported Python type: '{}' for FuRy serialization.",
-            type_name
-        ))),
-    }
-}
-
 /// Global atomic cache container holding a pointer-assigned reference to the CPython `datetime.date` class metadata layout.
 ///
 /// Thread-safe and initialized exactly once upon the first processed date field retrieval.
@@ -240,6 +247,7 @@ fn value_to_python(py: Python<'_>, value: &ValueType) -> PyResult<Py<PyAny>> {
                 dt.hour(),
                 dt.minute(),
                 dt.second(),
+                dt.nanosecond() / 1000,
             ))?;
             Ok(py_dt.unbind())
         }
@@ -266,4 +274,78 @@ fn value_to_python(py: Python<'_>, value: &ValueType) -> PyResult<Py<PyAny>> {
             "Nested models serialization not implemented",
         )),
     }
+}
+
+fn parse_python_type(type_obj: &Bound<'_, PyAny>) -> PyResult<(FieldType, bool)> {
+    let py = type_obj.py();
+    let typing = py.import("typing")?;
+    let get_origin = typing.getattr("get_origin")?;
+    let get_args = typing.getattr("get_args")?;
+
+    let origin = get_origin.call1((type_obj,))?;
+    let mut nullable = false;
+    let target = type_obj.clone();
+
+    if !origin.is_none() {
+        let args = get_args.call1((type_obj,))?;
+        let args = args.cast::<pyo3::types::PyTuple>()?;
+        let origin_name: String = origin
+            .getattr("__name__")
+            .and_then(|n| n.extract())
+            .unwrap_or_default();
+
+        match origin_name.as_str() {
+            "list" => {
+                let inner = args.get_item(0)?;
+                let (inner_type, _) = parse_python_type(&inner)?;
+                return Ok((FieldType::List(Box::new(inner_type)), nullable));
+            }
+            "dict" => {
+                let key = args.get_item(0)?;
+                let value = args.get_item(1)?;
+                let (key_type, _) = parse_python_type(&key)?;
+                let (val_type, _) = parse_python_type(&value)?;
+                return Ok((
+                    FieldType::Map(Box::new(key_type), Box::new(val_type)),
+                    nullable,
+                ));
+            }
+            "Union" | "UnionType" => {
+                let mut inner: Option<Bound<'_, PyAny>> = None;
+                for arg in args.iter() {
+                    if arg.is_none() {
+                        nullable = true;
+                    } else if inner.is_none() {
+                        inner = Some(arg);
+                    }
+                }
+                if let Some(t) = inner {
+                    let (ft, _) = parse_python_type(&t)?;
+                    return Ok((ft, nullable));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let module: String = target.getattr("__module__")?.extract().unwrap_or_default();
+    let name: String = target.getattr("__name__")?.extract().unwrap_or_default();
+
+    let f_type = match (module.as_str(), name.as_str()) {
+        ("builtins", "int") => FieldType::Int64,
+        ("builtins", "str") => FieldType::String,
+        ("builtins", "bool") => FieldType::Bool,
+        ("builtins", "float") => FieldType::Float64,
+        ("builtins", "bytes") | ("builtins", "bytearray") => FieldType::Bytes,
+        ("datetime", "datetime") => FieldType::DateTime,
+        ("datetime", "date") => FieldType::Date,
+        ("uuid", "UUID") => FieldType::Uuid,
+        _ => {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "Unsupported Fury annotation: {module}.{name}"
+            )));
+        }
+    };
+
+    Ok((f_type, nullable))
 }

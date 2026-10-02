@@ -3,8 +3,13 @@ name = "fury-ts"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
-fury-core = { path = "../fury-core" }
+fury-core = { path = "../fury-core", default-features = false }
 wasm-bindgen = "0.2.126"
 console_error_panic_hook = "0.1.7"
 js-sys = "0.3.103"
+chrono = "0.4.45"
+bincode = "1.3.3"

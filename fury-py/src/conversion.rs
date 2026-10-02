@@ -46,11 +46,39 @@ pub fn python_to_sql_value(obj: &Bound<'_, PyAny>) -> PyResult<SqlValue> {
         return Ok(SqlValue::Bytes(val));
     }
 
-    // uuid.UUID → String (SQLx Any doesn't support UUID natively)
+    // После проверки PyBytes, перед UUID:
     let type_name: String = obj.get_type().name()?.extract()?;
-    if type_name == "UUID" {
-        let uuid_str: String = obj.call_method0("__str__")?.extract()?;
-        return Ok(SqlValue::String(uuid_str));
+    let module: String = obj.get_type().getattr("__module__")?.extract().unwrap_or_default();
+
+    match (module.as_str(), type_name.as_str()) {
+        ("datetime", "datetime") => {
+            let year: i32 = obj.getattr("year")?.extract()?;
+            let month: u32 = obj.getattr("month")?.extract()?;
+            let day: u32 = obj.getattr("day")?.extract()?;
+            let hour: u32 = obj.getattr("hour")?.extract()?;
+            let minute: u32 = obj.getattr("minute")?.extract()?;
+            let second: u32 = obj.getattr("second")?.extract()?;
+            let microsecond: u32 = obj.getattr("microsecond")?.extract()?;
+            let dt = chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .and_then(|d| d.and_hms_micro_opt(hour, minute, second, microsecond))
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Invalid datetime"))?;
+            return Ok(SqlValue::DateTime(dt));
+        }
+        ("datetime", "date") => {
+            let year: i32 = obj.getattr("year")?.extract()?;
+            let month: u32 = obj.getattr("month")?.extract()?;
+            let day: u32 = obj.getattr("day")?.extract()?;
+            let d = chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("Invalid date"))?;
+            return Ok(SqlValue::Date(d));
+        }
+        ("uuid", "UUID") => {
+            let uuid_str: String = obj.call_method0("__str__")?.extract()?;
+            let u = uuid::Uuid::parse_str(&uuid_str)
+                .map_err(|_| pyo3::exceptions::PyValueError::new_err("Invalid UUID"))?;
+            return Ok(SqlValue::Uuid(u));
+        }
+        _ => {}
     }
 
     Err(pyo3::exceptions::PyTypeError::new_err(format!(

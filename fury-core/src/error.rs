@@ -81,6 +81,7 @@ pub enum FuryError {
     InvalidSchema(Box<str>),
 }
 
+#[cfg(feature = "db")]
 impl From<sqlx::Error> for FuryError {
     fn from(err: sqlx::Error) -> Self {
         Self::Database(Arc::from(err.to_string()))

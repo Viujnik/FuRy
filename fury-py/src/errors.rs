@@ -45,10 +45,10 @@ pub fn fury_error_to_pyerr(err: FuryError) -> PyErr {
             field, expected, actual
         )),
         FuryError::BufferNotFinished => {
-            PyRuntimeError::new_err("Attempted to read from an incomplete FlatBuffer builder")
+            PyRuntimeError::new_err("Attempted to read from an incomplete binary record")
         }
         FuryError::BufferAlreadyFinished => PyRuntimeError::new_err(
-            "FlatBuffer builder is already finalized and cannot be modified",
+            "Binary record is already finalized and cannot be modified",
         ),
         FuryError::InvalidSchema(msg) => {
             PyValueError::new_err(format!("Invalid metadata structure: {}", msg))

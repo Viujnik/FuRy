@@ -193,14 +193,13 @@ impl FuryDB {
         let executor = Arc::clone(&self.executor);
 
         future_into_py(py, async move {
-            let rows = executor
-                .execute_raw(&query, sql_args)
+            let affected = executor
+                .execute_affected(&query, sql_args)
                 .await
                 .map_err(fury_error_to_pyerr)?;
 
             Python::attach(|py| -> PyResult<Py<PyAny>> {
-                let len = rows.len();
-                let py_int = len.into_pyobject(py)?;
+                let py_int = (affected as i64).into_pyobject(py)?;
                 Ok(py_int.into_any().unbind())
             })
         })

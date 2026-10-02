@@ -1,10 +1,11 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Supported database field data types inside the FuRy serialization engine.
 ///
 /// Handles primitive scalars, fixed-size temporal types, and recursive complex
 /// structures like lists, maps, and nested database objects.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FieldType {
     Int8,
     Int16,

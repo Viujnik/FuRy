@@ -28,7 +28,7 @@ pub struct FuryCli {
 /// Defines the available subcommands for the CLI.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Generate highly optimized cross-language models from registry schemas.
+    /// Generate cross-language models from registry schemas.
     Generate {
         /// Source language context.
         #[arg(short = 'f', long, value_enum)]

@@ -9,7 +9,6 @@ use cli::FuryCli;
 
 pub use fury_core::schema::registry::get_global_registry;
 
-
 fn main() {
     let args = FuryCli::parse();
 

@@ -1,6 +1,8 @@
 use crate::get_global_registry;
 use fury_core::encoder::buffer::BinaryRecord;
 use fury_core::encoder::value::ValueType;
+use fury_core::schema::field::FieldType;
+use fury_core::schema::registry::FieldSchema;
 use wasm_bindgen::prelude::*;
 
 /// Represents a binary record mapped to a specific schema in WebAssembly.
@@ -27,62 +29,95 @@ impl WasmRecord {
     pub fn new(schema_name: &str, buffer: Option<Vec<u8>>) -> Result<WasmRecord, JsValue> {
         let schema = get_global_registry().get(schema_name).ok_or_else(|| {
             JsValue::from_str(&format!(
-                "Compilation failed: schema '{}' absent from registry",
-                schema_name
+                "Schema '{schema_name}' absent from registry — call loadRegistry() first"
             ))
         })?;
 
-        let record = BinaryRecord::from_raw_bytes(buffer.unwrap_or_default(), &schema)
-            .map_err(|e| JsValue::from_str(&format!("Binary stream parsing violation: {}", e)))?;
+        let record = match buffer {
+            Some(data) => BinaryRecord::from_raw_bytes(data, &schema)
+                .map_err(|e| JsValue::from_str(&format!("Binary stream parsing violation: {e}")))?,
+            None => BinaryRecord::new(schema),
+        };
 
         Ok(WasmRecord { inner: record })
     }
 
+    #[inline]
+    fn field_schema(&self, field_name: &str) -> Result<&FieldSchema, JsValue> {
+        self.inner
+            .schema()
+            .find_field(field_name)
+            .ok_or_else(|| JsValue::from_str(&format!("Field '{field_name}' not in schema")))
+    }
+
+    #[inline]
+    fn decode(&self, field_name: &str) -> Result<ValueType, JsValue> {
+        let field = self.field_schema(field_name)?;
+        let bytes = self
+            .inner
+            .get_field_bytes(field_name)
+            .ok_or_else(|| JsValue::from_str(&format!("Field '{field_name}' was never set")))?;
+
+        ValueType::from_bytes(bytes, field.field_type())
+            .ok_or_else(|| JsValue::from_str(&format!("Corrupt bytes in field '{field_name}'")))
+    }
+
     /// Retrieves a numeric field value as an `f64` (JavaScript's native number type).
     #[wasm_bindgen(js_name = getNumber)]
-    pub fn get_number(&self, field_name: &str) -> Result<f64, JsValue> {
-        let (offset, length) = self.get_bounds(field_name)?;
-        let bytes = &self.get_buffer_slice()?[offset..(offset + length)];
-
-        match length {
-            4 => {
-                let array: [u8; 4] = bytes.try_into().map_err(|_| {
-                    JsValue::from_str("Invalid slice boundaries size for Int32 mapping")
-                })?;
-                Ok(i32::from_le_bytes(array) as f64)
-            }
-            8 => {
-                let array: [u8; 8] = bytes.try_into().map_err(|_| {
-                    JsValue::from_str("Invalid slice boundaries size for 64-bit mapping")
-                })?;
-
-                let float_val = f64::from_le_bytes(array);
-                if float_val.is_nan() || float_val.is_infinite() {
-                    Ok(i64::from_le_bytes(array) as f64)
-                } else {
-                    Ok(float_val)
-                }
-            }
-            _ => Err(JsValue::from_str(
-                "Type mismatch violation: target boundary size is not a scalar number",
-            )),
+    pub fn get_number(&self, field_name: &str) -> Result<JsValue, JsValue> {
+        match self.decode(field_name)? {
+            ValueType::None => Ok(JsValue::NULL),
+            ValueType::Int8(v) => Ok((v as f64).into()),
+            ValueType::Int16(v) => Ok((v as f64).into()),
+            ValueType::Int32(v) => Ok((v as f64).into()),
+            ValueType::Int64(v) => Ok((v as f64).into()),
+            ValueType::UInt8(v) => Ok((v as f64).into()),
+            ValueType::UInt16(v) => Ok((v as f64).into()),
+            ValueType::UInt32(v) => Ok((v as f64).into()),
+            ValueType::UInt64(v) => Ok((v as f64).into()),
+            ValueType::Float32(v) => Ok((v as f64).into()),
+            ValueType::Float64(v) => Ok(v.into()),
+            other => Err(JsValue::from_str(&format!(
+                "Field '{field_name}' holds {other:?}, not a number"
+            ))),
         }
     }
 
     /// Updates a numeric field, automatically repacking the underlying binary layout.
     #[wasm_bindgen(js_name = setNumber)]
     pub fn set_number(&mut self, field_name: &str, value: f64) -> Result<(), JsValue> {
-        self.set_field(field_name, ValueType::Float64(value))
+        let field = self.field_schema(field_name)?;
+        let typed = match field.field_type() {
+            FieldType::Int8 => ValueType::Int8(value as i8),
+            FieldType::Int16 => ValueType::Int16(value as i16),
+            FieldType::Int32 => ValueType::Int32(value as i32),
+            FieldType::Int64 => ValueType::Int64(value as i64),
+            FieldType::UInt8 => ValueType::UInt8(value as u8),
+            FieldType::UInt16 => ValueType::UInt16(value as u16),
+            FieldType::UInt32 => ValueType::UInt32(value as u32),
+            FieldType::UInt64 => ValueType::UInt64(value as u64),
+            FieldType::Float32 => ValueType::Float32(value as f32),
+            FieldType::Float64 => ValueType::Float64(value),
+            other => {
+                return Err(JsValue::from_str(&format!(
+                    "Cannot write number into '{field_name}' of type {other:?}"
+                )));
+            }
+        };
+        self.set_field(field_name, typed)
     }
 
     /// Extracts a UTF-8 string from the binary payload.
     /// Note: Allocation is required here as JS strings are UTF-16.
     #[wasm_bindgen(js_name = getString)]
-    pub fn get_string(&self, field_name: &str) -> Result<String, JsValue> {
-        let (offset, length) = self.get_bounds(field_name)?;
-        let bytes = &self.get_buffer_slice()?[offset..(offset + length)];
-        String::from_utf8(bytes.to_vec())
-            .map_err(|e| JsValue::from_str(&format!("Malformed UTF-8 context parsed: {}", e)))
+    pub fn get_string(&self, field_name: &str) -> Result<JsValue, JsValue> {
+        match self.decode(field_name)? {
+            ValueType::None => Ok(JsValue::NULL),
+            ValueType::String(s) => Ok(s.into()),
+            other => Err(JsValue::from_str(&format!(
+                "Field '{field_name}' holds {other:?}, not a string"
+            ))),
+        }
     }
 
     /// Re-allocates and writes a new string value, shifting subsequent field offsets.
@@ -93,10 +128,14 @@ impl WasmRecord {
 
     /// Reads a single byte to evaluate a native boolean value.
     #[wasm_bindgen(js_name = getBool)]
-    pub fn get_bool(&self, field_name: &str) -> Result<bool, JsValue> {
-        let (offset, _) = self.get_bounds(field_name)?;
-        let bytes = self.get_buffer_slice()?;
-        Ok(bytes[offset] != 0)
+    pub fn get_bool(&self, field_name: &str) -> Result<JsValue, JsValue> {
+        match self.decode(field_name)? {
+            ValueType::None => Ok(JsValue::NULL),
+            ValueType::Bool(b) => Ok(b.into()),
+            other => Err(JsValue::from_str(&format!(
+                "Field '{field_name}' holds {other:?}, not a bool"
+            ))),
+        }
     }
 
     /// Encodes a boolean flag directly into the binary stream.
@@ -107,20 +146,68 @@ impl WasmRecord {
 
     /// Instantiates a native JavaScript `Date` object from a serialized ISO string.
     #[wasm_bindgen(js_name = getDate)]
-    pub fn get_date(&self, field_name: &str) -> Result<js_sys::Date, JsValue> {
-        let date_str = self.get_string(field_name)?;
-        Ok(js_sys::Date::new(&JsValue::from_str(&date_str)))
+    pub fn get_date(&self, field_name: &str) -> Result<JsValue, JsValue> {
+        match self.decode(field_name)? {
+            ValueType::None => Ok(JsValue::NULL),
+            ValueType::DateTime(dt) => Ok(js_sys::Date::new(&JsValue::from_f64(
+                dt.and_utc().timestamp_millis() as f64,
+            ))
+            .into()),
+            ValueType::Date(d) => Ok(js_sys::Date::new(&JsValue::from_f64(
+                d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis() as f64,
+            ))
+            .into()),
+            other => Err(JsValue::from_str(&format!(
+                "'{field_name}' holds {other:?}, not a date"
+            ))),
+        }
     }
 
     /// Converts a JavaScript `Date` instance into an ISO string for binary storage.
     #[wasm_bindgen(js_name = setDate)]
     pub fn set_date(&mut self, field_name: &str, value: &js_sys::Date) -> Result<(), JsValue> {
-        let iso = value.to_iso_string().as_string().ok_or_else(|| {
-            JsValue::from_str("Invalid JavaScript Date object wrapper declaration")
-        })?;
+        let ms = value.get_time();
+        if ms.is_nan() {
+            return Err(JsValue::from_str("Invalid Date"));
+        }
+        let field = self.field_schema(field_name)?;
+        let typed = match field.field_type() {
+            FieldType::DateTime => {
+                let dt = chrono::DateTime::from_timestamp_millis(ms as i64)
+                    .ok_or_else(|| JsValue::from_str("Date out of range"))?
+                    .naive_utc();
+                ValueType::DateTime(dt)
+            }
+            FieldType::Date => {
+                let days = (ms as i64).div_euclid(86_400_000) as i32;
+                let date = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                    .and_then(|e| e.checked_add_signed(chrono::Duration::days(days as i64)))
+                    .ok_or_else(|| JsValue::from_str("Date out of range"))?;
+                ValueType::Date(date)
+            }
+            other => {
+                return Err(JsValue::from_str(&format!(
+                    "Cannot write date into {other:?}"
+                )));
+            }
+        };
+        self.set_field(field_name, typed)
+    }
 
-        let clean_iso: String = iso.chars().take(10).collect();
-        self.set_field(field_name, ValueType::String(clean_iso))
+    #[wasm_bindgen(js_name = getBytes)]
+    pub fn get_bytes(&self, field_name: &str) -> Result<JsValue, JsValue> {
+        match self.decode(field_name)? {
+            ValueType::None => Ok(JsValue::NULL),
+            ValueType::Bytes(b) => Ok(js_sys::Uint8Array::from(b.as_slice()).into()),
+            other => Err(JsValue::from_str(&format!(
+                "Field '{field_name}' holds {other:?}, not bytes"
+            ))),
+        }
+    }
+
+    #[wasm_bindgen(js_name = setBytes)]
+    pub fn set_bytes(&mut self, field_name: &str, value: &[u8]) -> Result<(), JsValue> {
+        self.set_field(field_name, ValueType::Bytes(value.to_vec()))
     }
 
     /// Deserializes a list of nested objects, instantiating them via the provided JS constructor.
@@ -130,77 +217,57 @@ impl WasmRecord {
         field_name: &str,
         constructor: js_sys::Function,
     ) -> Result<js_sys::Array, JsValue> {
-        let (offset, length) = self.get_bounds(field_name)?;
-        let list_bytes = &self.get_buffer_slice()?[offset..(offset + length)];
-
-        let array_container = js_sys::Array::new();
-
-        let mut cursor = 0;
-        while cursor < list_bytes.len() {
-            if cursor + 4 > list_bytes.len() {
-                return Err(JsValue::from_str(
-                    "Malformed nested list packet: unexpected EOF parsing element length header",
-                ));
+        let items = match self.decode(field_name)? {
+            ValueType::List(i) => i,
+            ValueType::None => return Ok(js_sys::Array::new()),
+            other => {
+                return Err(JsValue::from_str(&format!(
+                    "'{field_name}' is {other:?}, not a list"
+                )));
             }
-
-            let item_len = u32::from_le_bytes([
-                list_bytes[cursor],
-                list_bytes[cursor + 1],
-                list_bytes[cursor + 2],
-                list_bytes[cursor + 3],
-            ]) as usize;
-
-            cursor += 4;
-
-            if cursor + item_len > list_bytes.len() {
-                return Err(JsValue::from_str(
-                    "Out of bounds read detected during nested model record parsing iteration",
-                ));
-            }
-
-            let child_model_bytes = &list_bytes[cursor..(cursor + item_len)];
-
-            // Создаем zero-copy проекцию памяти для кучи JS
-            let js_bytes_view = unsafe { js_sys::Uint8Array::view(child_model_bytes) };
-
-            let constructor_args = js_sys::Array::new();
-            constructor_args.push(&js_bytes_view.into());
-
-            let instance = js_sys::Reflect::construct(&constructor, &constructor_args)?;
-            array_container.push(&instance);
-
-            cursor += item_len;
+        };
+        let out = js_sys::Array::new();
+        for item in items {
+            let child: Vec<u8> = match item {
+                ValueType::Object(b) | ValueType::Bytes(b) => b,
+                other => return Err(JsValue::from_str(&format!("list item is {other:?}"))),
+            };
+            let copy = js_sys::Uint8Array::from(child.as_slice());
+            let args = js_sys::Array::new();
+            args.push(&copy.into());
+            out.push(&js_sys::Reflect::construct(&constructor, &args)?);
         }
-
-        Ok(array_container)
+        Ok(out)
     }
 
     /// Serializes an array of JavaScript model instances back into a raw byte layout.
     #[wasm_bindgen(js_name = setObjectList)]
-    pub fn set_object_list(&mut self, field_name: &str, value: js_sys::Array) -> Result<(), JsValue> {
-        let mut compiled_items = Vec::with_capacity(value.length() as usize);
-
+    pub fn set_object_list(
+        &mut self,
+        field_name: &str,
+        value: js_sys::Array,
+    ) -> Result<(), JsValue> {
+        let mut items = Vec::with_capacity(value.length() as usize);
         for i in 0..value.length() {
-            let item_instance = value.get(i);
-
-            let to_bytes_property = js_sys::Reflect::get(&item_instance, &JsValue::from_str("toBytes"))
-                .map_err(|_| JsValue::from_str("Serialization error: list items must have a 'toBytes' method available"))?;
-
-            let to_bytes_function = to_bytes_property.dyn_ref::<js_sys::Function>()
-                .ok_or_else(|| JsValue::from_str("Type error: 'toBytes' attribute property binding is not a callable function"))?;
-
-            let empty_args = js_sys::Array::new();
-            let bytes_js = js_sys::Reflect::apply(to_bytes_function, &item_instance, &empty_args)?;
-            let raw_child_bytes = js_sys::Uint8Array::from(bytes_js).to_vec();
-
-            let child_len = raw_child_bytes.len() as u32;
-            let mut packed_child_payload = child_len.to_le_bytes().to_vec();
-            packed_child_payload.extend(raw_child_bytes);
-
-            compiled_items.push(ValueType::Bytes(packed_child_payload));
+            let inst = value.get(i);
+            let f = js_sys::Reflect::get(&inst, &"toBytes".into())?
+                .dyn_into::<js_sys::Function>()
+                .map_err(|_| JsValue::from_str("list items must expose toBytes()"))?;
+            let bytes =
+                js_sys::Uint8Array::from(js_sys::Reflect::apply(&f, &inst, &js_sys::Array::new())?)
+                    .to_vec();
+            items.push(ValueType::Object(bytes));
         }
+        self.set_field(field_name, ValueType::List(items))
+    }
 
-        self.set_field(field_name, ValueType::List(compiled_items))
+    /// Finalizes the record; must be called before toBytes() after any setters.
+    #[wasm_bindgen(js_name = finish)]
+    pub fn finish(&mut self) -> Result<(), JsValue> {
+        self.inner
+            .finish()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        Ok(())
     }
 
     /// Exports the mutated binary record as a native JavaScript `Uint8Array`.
@@ -213,23 +280,10 @@ impl WasmRecord {
     }
 
     #[inline]
-    fn get_bounds(&self, field_name: &str) -> Result<(usize, usize), JsValue> {
-        self.inner.get_field_offset(field_name).ok_or_else(|| {
-            JsValue::from_str(&format!(
-                "Requested field '{field_name}' absent from layout offsets"
-            ))
-        })
-    }
-
-    #[inline]
-    fn get_buffer_slice(&self) -> Result<&[u8], JsValue> {
-        self.inner
-            .as_bytes()
-            .map_err(|e| JsValue::from_str(&e.to_string()))
-    }
-
-    #[inline]
     fn set_field(&mut self, field_name: &str, value: ValueType) -> Result<(), JsValue> {
+        if self.inner.is_finished() {
+            self.inner.reopen();
+        }
         self.inner
             .set_field(field_name, value)
             .map_err(|e| JsValue::from_str(&e.to_string()))

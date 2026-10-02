@@ -1,10 +1,13 @@
+pub use super::field::FieldType;
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
-
-pub use super::field::FieldType;
-
 use std::sync::OnceLock;
+
+const REGISTRY_CACHE_FILE: &str = ".fury_registry.bin";
 
 static GLOBAL_REGISTRY: OnceLock<SchemaRegistry> = OnceLock::new();
 
@@ -25,18 +28,54 @@ pub struct SchemaRegistry {
 }
 
 impl SchemaRegistry {
-    /// Creates a new empty schema registry.
+    /// Creates a registry hydrated from the on-disk cache (`.fury_registry.bin`
+    /// in the current working directory). On any read/parse failure — or on
+    /// platforms without a filesystem (WASM32) — the registry starts empty.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        let mut map = HashMap::new();
+
+        if Path::new(REGISTRY_CACHE_FILE).exists() {
+            if let Ok(mut file) = File::open(REGISTRY_CACHE_FILE) {
+                let mut buf = Vec::new();
+                if file.read_to_end(&mut buf).is_ok() {
+                    if let Ok(schemas) = bincode::deserialize::<Vec<ModelSchema>>(&buf) {
+                        for mut schema in schemas {
+                            schema.field_index = ModelSchema::build_field_index(&schema.fields);
+                            map.insert(schema.name().to_string(), Arc::new(schema));
+                        }
+                    }
+                }
+            }
+        }
+
+        Self {
+            inner: Arc::new(RwLock::new(map)),
+        }
     }
 
     /// Registers a new model schema.
     ///
     /// If a schema with the same name already exists, it will be replaced.
     pub fn register(&self, schema: ModelSchema) {
+        let name = schema.name().to_string();
+        let schema_arc = Arc::new(schema);
+
         let mut map = self.inner.write();
-        map.insert(schema.name.clone(), Arc::from(schema));
+        map.insert(name, schema_arc);
+
+        let schemas_to_save: Vec<ModelSchema> = map.values().map(|arc| (**arc).clone()).collect();
+
+        if let Ok(encoded) = bincode::serialize(&schemas_to_save) {
+            let tmp = format!("{REGISTRY_CACHE_FILE}.tmp");
+            if fs::write(&tmp, &encoded).is_ok() {
+                if let Err(e) = fs::rename(&tmp, REGISTRY_CACHE_FILE) {
+                    eprintln!("[fury] registry persist failed: {e}");
+                }
+            } else {
+                eprintln!("[fury] registry persist failed: cannot write tmp file");
+            }
+        }
     }
 
     /// Retrieves a model schema by name.
@@ -91,10 +130,11 @@ impl SchemaRegistry {
 ///
 /// Contains the model name, field definitions, and a pre-computed index
 /// for fast field lookup by name.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ModelSchema {
     name: String,
     fields: Vec<FieldSchema>,
+    #[serde(skip)]
     field_index: HashMap<String, usize>,
 }
 
@@ -159,7 +199,7 @@ impl ModelSchema {
 }
 
 /// Schema definition for a single field.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FieldSchema {
     name: String,
     field_type: FieldType,

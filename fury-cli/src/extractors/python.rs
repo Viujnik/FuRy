@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 
 /// Cached regular expression. Compiled exactly once upon first invocation.
 static PYTHON_MODEL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*[^)]*?(?:BaseModel|FuryBaseModel|Model)[^)]*?\)\s*:").unwrap()
+    Regex::new(r"(?m)^[ \t]*class\s+([A-Za-z_]\w*)\s*\([^)]*\bFuryBaseModel\b[^)]*\)\s*:").unwrap()
 });
 
 /// Extracts class names inheriting from BaseModel variants.
