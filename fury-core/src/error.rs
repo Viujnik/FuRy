@@ -5,7 +5,6 @@ use thiserror::Error;
 ///
 /// This enum represents all possible error conditions in FuRy, including
 /// database operations, serialization/deserialization, and schema validation.
-/// ```
 #[derive(Error, Debug, Clone)]
 pub enum FuryError {
     /// Database operation failed (connection error, query error, etc.).
@@ -82,8 +81,8 @@ pub enum FuryError {
 }
 
 #[cfg(feature = "db")]
-impl From<sqlx::Error> for FuryError {
-    fn from(err: sqlx::Error) -> Self {
+impl From<sqlx_core::Error> for FuryError {
+    fn from(err: sqlx_core::Error) -> Self {
         Self::Database(Arc::from(err.to_string()))
     }
 }

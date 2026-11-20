@@ -104,9 +104,9 @@ stdout - служебный канал для кодогенерации, обы
 + origin = `dict` → рекурсия в ключ и значение и `FieldType::Map`;
 + origin = `Union` или `UnionType`
   (синтаксис `Type | None` из Python 3.10+) → проход по аргументам: `NoneType`
-  выставляет nullable, первый не-None аргумент рекурсивно разбирается и
-  возвращается вместе с флагом - поэтому `Optional[list[int]]` корректно даёт
-  `List(Int64)` + nullable.
+  выставляет nullable. Допускается ровно один тип значения.
+  `Optional[list[int]]` даёт nullable `List(Int64)`, а union нескольких
+  типов значений возвращает `TypeError`.
 + Для обычного класса (origin = None) сверяется пара
   (`__module__`, `__name__`) с таблицей точных соответствий: `builtins.int` →
   Int64, `builtins.str` → String, `builtins.bool` → Bool, `builtins.float` →
@@ -231,7 +231,7 @@ async-блока - и `create_py_model_instance`. Возвращается го�
 + Дальше для типов, которые downcast'ом не поймать, сверяется пара
   (`__module__`, имя типа):
     + `datetime.datetime` → `SqlValue::DateTime`
-      (атрибуты год..микросекунда собираются в `NaiveDateTime`, невалидная дата -
+      (поддерживается datetime без часового пояса, часовой пояс вызывает
       `ValueError`);
     + `datetime.date` → `SqlValue::Date`;
     + `uuid.UUID` →

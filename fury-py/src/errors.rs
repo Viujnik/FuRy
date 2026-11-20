@@ -47,9 +47,9 @@ pub fn fury_error_to_pyerr(err: FuryError) -> PyErr {
         FuryError::BufferNotFinished => {
             PyRuntimeError::new_err("Attempted to read from an incomplete binary record")
         }
-        FuryError::BufferAlreadyFinished => PyRuntimeError::new_err(
-            "Binary record is already finalized and cannot be modified",
-        ),
+        FuryError::BufferAlreadyFinished => {
+            PyRuntimeError::new_err("Binary record is already finalized and cannot be modified")
+        }
         FuryError::InvalidSchema(msg) => {
             PyValueError::new_err(format!("Invalid metadata structure: {}", msg))
         }

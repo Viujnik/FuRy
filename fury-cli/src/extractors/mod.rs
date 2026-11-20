@@ -4,7 +4,7 @@ pub mod python_import;
 use crate::cli::LangFrom;
 use crate::errors::CliError;
 use std::fs;
-use std::path::PathBuf;
+use std::path::Path;
 
 /// Extracts model names from source files based on the language.
 ///
@@ -24,12 +24,12 @@ use std::path::PathBuf;
 ///
 /// # Example
 ///
-/// ```rust
-/// let path = PathBuf::from("models/user.py");
-/// let names = extract_model_names(&path, LangFrom::Python)?;
+/// ```text
+/// let path = Path::new("models/user.py");
+/// let names = extract_model_names(path, LangFrom::Python)?;
 /// // Returns: ["User", "UserCreate", "UserUpdate", ...]
 /// ```
-pub fn extract_model_names(src_path: &PathBuf, lang: LangFrom) -> Result<Vec<String>, CliError> {
+pub fn extract_model_names(src_path: &Path, lang: LangFrom) -> Result<Vec<String>, CliError> {
     match lang {
         LangFrom::Python => {
             let emitted = python_import::import_python_module(src_path)?;
@@ -38,7 +38,7 @@ pub fn extract_model_names(src_path: &PathBuf, lang: LangFrom) -> Result<Vec<Str
             }
 
             let content = fs::read_to_string(src_path).map_err(|e| CliError::Io {
-                path: src_path.clone(),
+                path: src_path.to_path_buf(),
                 source: e,
             })?;
             python::extract_model_names(&content)

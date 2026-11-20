@@ -8,24 +8,121 @@ use crate::errors::CliError;
 
 /// Iterates over validated schemas and writes the corresponding TypeScript classes to disk.
 pub fn generate_all(schemas: &[Arc<ModelSchema>], dst_dir: &Path) -> Result<(), CliError> {
-    if !dst_dir.exists() {
-        fs::create_dir_all(dst_dir).map_err(|e| CliError::Io {
-            path: dst_dir.to_path_buf(),
-            source: e,
-        })?;
-    }
-
+    let mut filenames = std::collections::HashSet::new();
+    let mut generated = Vec::with_capacity(schemas.len());
     for schema in schemas {
-        let ts_code = generate_class_string(schema);
-        let file_name = format!("{}.ts", schema.name().to_lowercase());
-        let file_path = dst_dir.join(&file_name);
-
-        fs::write(&file_path, ts_code).map_err(|e| CliError::Io {
-            path: file_path,
-            source: e,
-        })?;
+        validate_identifier(schema.name())?;
+        if ["$FuryWasmRecord", "globalThis"].contains(&schema.name()) {
+            return Err(CliError::ParseError(
+                "model name collides with generated imports".into(),
+            ));
+        }
+        let filename = format!("{}.ts", schema.name().to_lowercase());
+        if !filenames.insert(filename.clone()) {
+            return Err(CliError::ParseError(
+                "case-insensitive generated filename collision".into(),
+            ));
+        }
+        for field in schema
+            .fields()
+            .iter()
+            .filter(|f| ts_primitive_type(f.field_type()).is_some())
+        {
+            if ["constructor", "_internal", "toBytes", "$record"].contains(&field.name()) {
+                return Err(CliError::ParseError(format!(
+                    "field '{}.{}' collides with generated API",
+                    schema.name(),
+                    field.name()
+                )));
+            }
+        }
+        generated.push((filename, generate_class_string(schema)));
     }
 
+    fs::create_dir_all(dst_dir).map_err(|source| CliError::Io {
+        path: dst_dir.to_path_buf(),
+        source,
+    })?;
+    for (filename, code) in generated {
+        let path = dst_dir.join(filename);
+        fs::write(&path, code).map_err(|source| CliError::Io { path, source })?;
+    }
+    Ok(())
+}
+
+/// Check whether a name can be emitted as a safe TypeScript identifier.
+fn validate_identifier(name: &str) -> Result<(), CliError> {
+    let mut chars = name.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|c| unicode_ident::is_xid_start(c) || c == '_' || c == '$')
+        && chars.all(|c| unicode_ident::is_xid_continue(c) || c == '_' || c == '$');
+    let reserved = [
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "new",
+        "null",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+        "let",
+        "static",
+        "implements",
+        "interface",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "await",
+        "eval",
+        "arguments",
+        "any",
+        "boolean",
+        "number",
+        "string",
+        "symbol",
+        "unknown",
+        "never",
+        "object",
+        "bigint",
+        "undefined",
+        "intrinsic",
+    ];
+    if !valid || reserved.contains(&name) {
+        return Err(CliError::ParseError(format!(
+            "unsupported TypeScript identifier '{name}'"
+        )));
+    }
     Ok(())
 }
 
@@ -36,13 +133,20 @@ pub fn generate_all(schemas: &[Arc<ModelSchema>], dst_dir: &Path) -> Result<(), 
 /// custom accessors on top of the raw `WasmRecord` themselves.
 fn ts_primitive_type(field_type: &FieldType) -> Option<&'static str> {
     Some(match field_type {
-        FieldType::Int8 | FieldType::Int16 | FieldType::Int32 | FieldType::Int64
-        | FieldType::UInt8 | FieldType::UInt16 | FieldType::UInt32 | FieldType::UInt64
-        | FieldType::Float32 | FieldType::Float64 => "number",
+        FieldType::Int8
+        | FieldType::Int16
+        | FieldType::Int32
+        | FieldType::Int64
+        | FieldType::UInt8
+        | FieldType::UInt16
+        | FieldType::UInt32
+        | FieldType::UInt64
+        | FieldType::Float32
+        | FieldType::Float64 => "number",
         FieldType::Bool => "boolean",
         FieldType::String => "string",
-        FieldType::Bytes => "Uint8Array",
-        FieldType::DateTime | FieldType::Date => "Date",
+        FieldType::Bytes => "globalThis.Uint8Array",
+        FieldType::DateTime | FieldType::Date => "globalThis.Date",
         _ => return None,
     })
 }
@@ -68,14 +172,27 @@ fn generate_class_string(schema: &ModelSchema) -> String {
     let name = schema.name();
 
     writeln!(code, "// AUTO-GENERATED BY FURY CLI. DO NOT EDIT.").unwrap();
-    writeln!(code, "// Adjust the import path below to match your wasm-bindgen build output.").unwrap();
-    writeln!(code, "import {{ WasmRecord }} from '@fury/wasm-core';\n").unwrap();
+    writeln!(
+        code,
+        "// Adjust the import path below to match your wasm-bindgen build output."
+    )
+    .unwrap();
+    writeln!(
+        code,
+        "import {{ WasmRecord as $FuryWasmRecord }} from '@fury/wasm-core';\n"
+    )
+    .unwrap();
 
     writeln!(code, "export class {} {{", name).unwrap();
-    writeln!(code, "    private readonly _internal: WasmRecord;").unwrap();
+    writeln!(code, "    private readonly _internal: $FuryWasmRecord;").unwrap();
 
-    writeln!(code, "\n    constructor(buffer?: Uint8Array) {{").unwrap();
-    writeln!(code, "        this._internal = new WasmRecord('{}', buffer);", name).unwrap();
+    writeln!(code, "\n    constructor(buffer?: globalThis.Uint8Array) {{").unwrap();
+    writeln!(
+        code,
+        "        this._internal = new $FuryWasmRecord('{}', buffer);",
+        name
+    )
+    .unwrap();
     writeln!(code, "    }}").unwrap();
 
     for field in schema.fields() {
@@ -92,22 +209,48 @@ fn generate_class_string(schema: &ModelSchema) -> String {
             base.to_string()
         };
 
+        let key = ts_string(field_name);
         writeln!(
             code,
-            "\n    public get {}(): {} {{ return this._internal.{}('{}'); }}",
-            field_name, getter_type, getter, field_name
+            "\n    public get [{key}](): {getter_type} {{ return this._internal.{getter}({key}); }}"
         )
-            .unwrap();
+        .unwrap();
+        let clear_null = if field.is_nullable() {
+            format!("if (val === null) {{ this._internal.setNull({key}); return; }} ")
+        } else {
+            String::new()
+        };
         writeln!(
             code,
-            "    public set {}(val: {}) {{ this._internal.{}('{}', val); }}",
-            field_name, base, setter, field_name
+            "    public set [{key}](val: {getter_type}) {{ {clear_null}this._internal.{setter}({key}, val); }}"
         )
-            .unwrap();
+        .unwrap();
     }
 
-    writeln!(code, "\n    public toBytes(): Uint8Array {{ return this._internal.toBytes(); }}").unwrap();
+    writeln!(code, "\n    public toBytes(): globalThis.Uint8Array {{ return this._internal.toFinishedBytes(); }}").unwrap();
+    writeln!(
+        code,
+        "    public get $record(): $FuryWasmRecord {{ return this._internal; }}"
+    )
+    .unwrap();
     writeln!(code, "}}").unwrap();
 
     code
+}
+
+/// Escape a field name in a TypeScript string literal.
+fn ts_string(name: &str) -> String {
+    let mut literal = String::from("'");
+    for ch in name.chars() {
+        match ch {
+            '\'' => literal.push_str("\\'"),
+            '\\' => literal.push_str("\\\\"),
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') => {
+                write!(literal, "\\u{:04x}", c as u32).unwrap();
+            }
+            c => literal.push(c),
+        }
+    }
+    literal.push('\'');
+    literal
 }

@@ -5,6 +5,8 @@ use fury_core::schema::field::FieldType;
 use fury_core::schema::registry::FieldSchema;
 use wasm_bindgen::prelude::*;
 
+const MAX_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
+
 /// Represents a binary record mapped to a specific schema in WebAssembly.
 ///
 /// Provides zero-copy or minimal-allocation access to binary data,
@@ -70,11 +72,16 @@ impl WasmRecord {
             ValueType::Int8(v) => Ok((v as f64).into()),
             ValueType::Int16(v) => Ok((v as f64).into()),
             ValueType::Int32(v) => Ok((v as f64).into()),
-            ValueType::Int64(v) => Ok((v as f64).into()),
+            ValueType::Int64(v) if (-MAX_SAFE_INTEGER..=MAX_SAFE_INTEGER).contains(&v) => {
+                Ok((v as f64).into())
+            }
             ValueType::UInt8(v) => Ok((v as f64).into()),
             ValueType::UInt16(v) => Ok((v as f64).into()),
             ValueType::UInt32(v) => Ok((v as f64).into()),
-            ValueType::UInt64(v) => Ok((v as f64).into()),
+            ValueType::UInt64(v) if v <= MAX_SAFE_INTEGER as u64 => Ok((v as f64).into()),
+            ValueType::Int64(_) | ValueType::UInt64(_) => Err(JsValue::from_str(
+                "integer exceeds the safe Number range; use getBigInt",
+            )),
             ValueType::Float32(v) => Ok((v as f64).into()),
             ValueType::Float64(v) => Ok(v.into()),
             other => Err(JsValue::from_str(&format!(
@@ -87,6 +94,22 @@ impl WasmRecord {
     #[wasm_bindgen(js_name = setNumber)]
     pub fn set_number(&mut self, field_name: &str, value: f64) -> Result<(), JsValue> {
         let field = self.field_schema(field_name)?;
+        let integer_range = match field.field_type() {
+            FieldType::Int8 => Some((f64::from(i8::MIN), f64::from(i8::MAX))),
+            FieldType::Int16 => Some((f64::from(i16::MIN), f64::from(i16::MAX))),
+            FieldType::Int32 => Some((f64::from(i32::MIN), f64::from(i32::MAX))),
+            FieldType::Int64 => Some((-MAX_SAFE_INTEGER as f64, MAX_SAFE_INTEGER as f64)),
+            FieldType::UInt8 => Some((0.0, f64::from(u8::MAX))),
+            FieldType::UInt16 => Some((0.0, f64::from(u16::MAX))),
+            FieldType::UInt32 => Some((0.0, f64::from(u32::MAX))),
+            FieldType::UInt64 => Some((0.0, MAX_SAFE_INTEGER as f64)),
+            _ => None,
+        };
+        if let Some((min, max)) = integer_range
+            && (value.fract() != 0.0 || !(min..=max).contains(&value))
+        {
+            return Err(JsValue::from_str("invalid integer or out of range"));
+        }
         let typed = match field.field_type() {
             FieldType::Int8 => ValueType::Int8(value as i8),
             FieldType::Int16 => ValueType::Int16(value as i16),
@@ -96,6 +119,9 @@ impl WasmRecord {
             FieldType::UInt16 => ValueType::UInt16(value as u16),
             FieldType::UInt32 => ValueType::UInt32(value as u32),
             FieldType::UInt64 => ValueType::UInt64(value as u64),
+            FieldType::Float32 if value.is_finite() && !(value as f32).is_finite() => {
+                return Err(JsValue::from_str("number exceeds the Float32 range"));
+            }
             FieldType::Float32 => ValueType::Float32(value as f32),
             FieldType::Float64 => ValueType::Float64(value),
             other => {
@@ -105,6 +131,53 @@ impl WasmRecord {
             }
         };
         self.set_field(field_name, typed)
+    }
+
+    /// Reads an exact signed or unsigned 64-bit integer.
+    #[wasm_bindgen(js_name = getBigInt, unchecked_return_type = "bigint | null")]
+    pub fn get_big_int(&self, field_name: &str) -> Result<JsValue, JsValue> {
+        let field = self.field_schema(field_name)?;
+        if !matches!(field.field_type(), FieldType::Int64 | FieldType::UInt64) {
+            return Err(JsValue::from_str(
+                "getBigInt requires an Int64 or UInt64 field",
+            ));
+        }
+        match self.decode(field_name)? {
+            ValueType::Int64(value) => Ok(js_sys::BigInt::from(value).into()),
+            ValueType::UInt64(value) => Ok(js_sys::BigInt::from(value).into()),
+            ValueType::None => Ok(JsValue::NULL),
+            _ => Err(JsValue::from_str("invalid 64-bit value")),
+        }
+    }
+
+    /// Writes a bigint after checking the complete signed or unsigned range.
+    #[wasm_bindgen(js_name = setBigInt)]
+    pub fn set_big_int(
+        &mut self,
+        field_name: &str,
+        #[wasm_bindgen(unchecked_param_type = "bigint")] value: JsValue,
+    ) -> Result<(), JsValue> {
+        if !value.is_bigint() {
+            return Err(JsValue::from_str("setBigInt requires a bigint"));
+        }
+        let value = value.unchecked_into::<js_sys::BigInt>();
+        let typed = match self.field_schema(field_name)?.field_type() {
+            FieldType::Int64 => i64::try_from(value).map(ValueType::Int64),
+            FieldType::UInt64 => u64::try_from(value).map(ValueType::UInt64),
+            _ => {
+                return Err(JsValue::from_str(
+                    "setBigInt requires an Int64 or UInt64 field",
+                ));
+            }
+        }
+        .map_err(|_| JsValue::from_str("bigint outside the field's 64-bit integer range"))?;
+        self.set_field(field_name, typed)
+    }
+
+    /// Writes an explicit null to a nullable field.
+    #[wasm_bindgen(js_name = setNull)]
+    pub fn set_null(&mut self, field_name: &str) -> Result<(), JsValue> {
+        self.set_field(field_name, ValueType::None)
     }
 
     /// Extracts a UTF-8 string from the binary payload.
@@ -247,16 +320,29 @@ impl WasmRecord {
         field_name: &str,
         value: js_sys::Array,
     ) -> Result<(), JsValue> {
-        let mut items = Vec::with_capacity(value.length() as usize);
-        for i in 0..value.length() {
+        let limits = fury_core::encoder::limits::DecodeLimits::default();
+        let count = value.length();
+        if count as usize >= limits.max_total_values || count as usize > limits.max_collection_items
+        {
+            return Err(JsValue::from_str(
+                "object list exceeds the collection limit",
+            ));
+        }
+        let mut remaining = limits.max_frame_bytes;
+        let mut items = Vec::with_capacity(count as usize);
+        for i in 0..count {
             let inst = value.get(i);
             let f = js_sys::Reflect::get(&inst, &"toBytes".into())?
                 .dyn_into::<js_sys::Function>()
                 .map_err(|_| JsValue::from_str("list items must expose toBytes()"))?;
-            let bytes =
-                js_sys::Uint8Array::from(js_sys::Reflect::apply(&f, &inst, &js_sys::Array::new())?)
-                    .to_vec();
-            items.push(ValueType::Object(bytes));
+            let bytes = js_sys::Reflect::apply(&f, &inst, &js_sys::Array::new())?
+                .dyn_into::<js_sys::Uint8Array>()
+                .map_err(|_| JsValue::from_str("toBytes() must return Uint8Array"))?;
+            remaining = remaining
+                .checked_sub(5)
+                .and_then(|bytes_left| bytes_left.checked_sub(bytes.length() as usize))
+                .ok_or_else(|| JsValue::from_str("object list exceeds the frame limit"))?;
+            items.push(ValueType::Object(bytes.to_vec()));
         }
         self.set_field(field_name, ValueType::List(items))
     }
@@ -276,16 +362,22 @@ impl WasmRecord {
         self.inner
             .as_bytes()
             .map_err(|e| JsValue::from_str(&e.to_string()))
-            .map(|b| js_sys::Uint8Array::from(b))
+            .map(js_sys::Uint8Array::from)
+    }
+
+    /// Exports the record from either writeable or finished state.
+    #[wasm_bindgen(js_name = toFinishedBytes)]
+    pub fn to_finished_bytes(&mut self) -> Result<js_sys::Uint8Array, JsValue> {
+        if !self.inner.is_finished() {
+            self.finish()?;
+        }
+        self.to_bytes()
     }
 
     #[inline]
     fn set_field(&mut self, field_name: &str, value: ValueType) -> Result<(), JsValue> {
-        if self.inner.is_finished() {
-            self.inner.reopen();
-        }
         self.inner
-            .set_field(field_name, value)
+            .update_field(field_name, value)
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 }

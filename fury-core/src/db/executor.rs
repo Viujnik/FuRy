@@ -3,8 +3,16 @@ use crate::encoder::buffer::BinaryRecord;
 use crate::encoder::value::ValueType;
 use crate::error::{FuryError, Result};
 use crate::schema::registry::{FieldType, ModelSchema, SchemaRegistry};
-use sqlx::postgres::{PgArguments, PgRow};
-use sqlx::{query_with, Arguments, Row};
+use sqlx_core::arguments::Arguments;
+use sqlx_core::column::Column;
+use sqlx_core::decode::Decode;
+use sqlx_core::error::BoxDynError;
+use sqlx_core::query::{query_with, Query};
+use sqlx_core::row::Row;
+use sqlx_core::sql_str::AssertSqlSafe;
+use sqlx_core::types::Type;
+use sqlx_core::value::ValueRef;
+use sqlx_postgres::{PgArguments, PgRow, Postgres};
 use std::sync::Arc;
 
 /// Executes SQL queries and converts results to binary format.
@@ -40,15 +48,15 @@ impl QueryExecutor {
         &self,
         query: &'q str,
         args: Vec<SqlValue>,
-    ) -> Result<sqlx::query::Query<'q, sqlx::Postgres, PgArguments>> {
+    ) -> Result<Query<'q, Postgres, PgArguments>> {
         let mut query_args = PgArguments::default();
         for arg in args {
             arg.bind_to(&mut query_args).map_err(|e| {
                 FuryError::Encoding(format!("Failed to bind query argument: {}", e).into())
             })?;
         }
-        Ok(query_with::<sqlx::Postgres, PgArguments>(
-            sqlx::AssertSqlSafe(query),
+        Ok(query_with::<Postgres, PgArguments>(
+            AssertSqlSafe(query),
             query_args,
         ))
     }
@@ -95,6 +103,16 @@ impl QueryExecutor {
     ///
     /// Returns an error if field extraction or type conversion fails.
     pub fn row_to_buffer(&self, row: &PgRow, schema: &Arc<ModelSchema>) -> Result<BinaryRecord> {
+        for column in row.columns() {
+            let name = column.name();
+            if schema.find_field(name).is_some()
+                && row.try_column(name)?.ordinal() != column.ordinal()
+            {
+                return Err(FuryError::Encoding(
+                    format!("Ambiguous result column '{name}'; use a unique SQL alias").into(),
+                ));
+            }
+        }
         let mut builder = BinaryRecord::new(Arc::clone(schema));
 
         for field in schema.fields() {
@@ -117,95 +135,48 @@ impl QueryExecutor {
         field_type: &FieldType,
     ) -> Result<ValueType> {
         macro_rules! extract {
-            ($sqlx_type:ty, $variant:ident, $expected:expr) => {{
-                let val: Option<$sqlx_type> = row
-                    .try_get(field_name)
-                    .map_err(|e| type_mismatch(field_name, $expected, e))?;
-                Ok(val.map(ValueType::$variant).unwrap_or(ValueType::None))
+            ($source:ty, $variant:ident) => {{
+                checked_get::<$source>(row, field_name)
+                    .map(|v| v.map(ValueType::$variant).unwrap_or(ValueType::None))
+                    .map_err(|err| type_mismatch(field_name, stringify!($variant), err))
             }};
         }
 
-        macro_rules! extract_cast {
-            ($target:ty, $source:ty, $variant:ident, $expected:expr) => {{
-                let val: Option<$source> = row
-                    .try_get::<Option<$source>, _>(field_name)
-                    .map_err(|e| type_mismatch(field_name, $expected, e))?;
-                Ok(val
-                    .map(|v| ValueType::$variant(v as $target))
-                    .unwrap_or(ValueType::None))
+        macro_rules! convert {
+            ($source:ty, $variant:ident, $target:ty) => {{
+                match checked_get::<$source>(row, field_name) {
+                    Ok(None) => Ok(ValueType::None),
+                    Ok(Some(value)) => <$target>::try_from(value)
+                        .map(ValueType::$variant)
+                        .map_err(|_| type_mismatch(field_name, stringify!($variant), value)),
+                    Err(err) => Err(type_mismatch(field_name, stringify!($variant), err)),
+                }
             }};
         }
 
         match field_type {
-            FieldType::Int8 => extract_cast!(i8, i16, Int8, "Int8"),
-            FieldType::Int16 => extract!(i16, Int16, "Int16"),
-            FieldType::Int32 => match row.try_get::<Option<i32>, _>(field_name) {
-                Ok(val) => Ok(val.map(ValueType::Int32).unwrap_or(ValueType::None)),
-                Err(_) => extract_cast!(i32, i16, Int32, "Int32"),
+            FieldType::Int8 => convert!(i16, Int8, i8),
+            FieldType::Int16 => extract!(i16, Int16),
+            FieldType::Int32 => extract!(i32, Int32).or_else(|_| convert!(i16, Int32, i32)),
+            FieldType::Int64 => extract!(i64, Int64).or_else(|_| convert!(i32, Int64, i64)),
+            FieldType::UInt8 => convert!(i16, UInt8, u8),
+            FieldType::UInt16 => convert!(i32, UInt16, u16),
+            FieldType::UInt32 => match checked_get::<i64>(row, field_name) {
+                Ok(None) => Ok(ValueType::None),
+                Ok(Some(value)) => u32::try_from(value)
+                    .map(ValueType::UInt32)
+                    .map_err(|_| type_mismatch(field_name, "UInt32", value)),
+                Err(_) => convert!(i32, UInt32, u32),
             },
-            FieldType::Int64 => match row.try_get::<Option<i64>, _>(field_name) {
-                Ok(val) => Ok(val.map(ValueType::Int64).unwrap_or(ValueType::None)),
-                Err(_) => extract_cast!(i64, i32, Int64, "Int64"),
-            },
-            FieldType::UInt8 => extract_cast!(u8, i16, UInt8, "UInt8"),
-            FieldType::UInt16 => extract_cast!(u16, i32, UInt16, "UInt16"),
-            FieldType::UInt32 => match row.try_get::<Option<i64>, _>(field_name) {
-                Ok(val) => match val {
-                    Some(v) => {
-                        let u = u32::try_from(v).map_err(|_| FuryError::TypeMismatch {
-                            field: field_name.into(),
-                            expected: "UInt32 (non-negative)".into(),
-                            actual: format!("out of range: {v}").into(),
-                        })?;
-                        Ok(ValueType::UInt32(u))
-                    }
-                    None => Ok(ValueType::None),
-                },
-                Err(_) => {
-                    let val: Option<i32> = row.try_get(field_name).map_err(|e| {
-                        type_mismatch(field_name, "UInt32 (fallback from Int32)", e)
-                    })?;
-                    match val {
-                        Some(v) => {
-                            let u = u32::try_from(v).map_err(|_| FuryError::TypeMismatch {
-                                field: field_name.into(),
-                                expected: "UInt32 (non-negative)".into(),
-                                actual: format!("negative i32 value: {v}").into(),
-                            })?;
-                            Ok(ValueType::UInt32(u))
-                        }
-                        None => Ok(ValueType::None),
-                    }
-                }
-            },
-            FieldType::UInt64 => {
-                let val: Option<i64> = row
-                    .try_get(field_name)
-                    .map_err(|e| type_mismatch(field_name, "UInt64", e))?;
-                match val {
-                    Some(v) => {
-                        let u_val = u64::try_from(v).map_err(|_| FuryError::TypeMismatch {
-                            field: field_name.into(),
-                            expected: "UInt64 (non-negative)".into(),
-                            actual: format!("negative i64 value: {}", v).into(),
-                        })?;
-                        Ok(ValueType::UInt64(u_val))
-                    }
-                    None => Ok(ValueType::None),
-                }
-            }
-            FieldType::Float32 => extract!(f32, Float32, "Float32"),
-
-            FieldType::Float64 => match row.try_get::<Option<f64>, _>(field_name) {
-                Ok(val) => Ok(val.map(ValueType::Float64).unwrap_or(ValueType::None)),
-                Err(_) => extract_cast!(f64, f32, Float64, "Float64"),
-            },
-            FieldType::Bool => extract!(bool, Bool, "Bool"),
-            FieldType::String => extract!(String, String, "String"),
-            FieldType::Bytes => extract!(Vec<u8>, Bytes, "Bytes"),
-            FieldType::Date => extract!(chrono::NaiveDate, Date, "Date"),
-            FieldType::DateTime => extract!(chrono::NaiveDateTime, DateTime, "DateTime"),
-            FieldType::Uuid => extract!(uuid::Uuid, Uuid, "Uuid"),
+            FieldType::UInt64 => convert!(i64, UInt64, u64),
+            FieldType::Float32 => extract!(f32, Float32),
+            FieldType::Float64 => extract!(f64, Float64).or_else(|_| convert!(f32, Float64, f64)),
+            FieldType::Bool => extract!(bool, Bool),
+            FieldType::String => extract!(String, String),
+            FieldType::Bytes => extract!(Vec<u8>, Bytes),
+            FieldType::Date => extract!(chrono::NaiveDate, Date),
+            FieldType::DateTime => extract!(chrono::NaiveDateTime, DateTime),
+            FieldType::Uuid => extract!(uuid::Uuid, Uuid),
             FieldType::List(_) | FieldType::Map(_, _) | FieldType::Object(_) => {
                 Err(FuryError::Encoding(
                     format!(
@@ -230,6 +201,28 @@ impl QueryExecutor {
     pub fn pool(&self) -> &DatabasePool {
         &self.pool
     }
+}
+
+// Row::try_get skips SQLx type checks for null. The column contract still applies.
+fn checked_get<'r, T>(
+    row: &'r PgRow,
+    name: &str,
+) -> std::result::Result<Option<T>, sqlx_core::Error>
+where
+    T: Decode<'r, Postgres> + Type<Postgres>,
+{
+    let value = row.try_get_raw(name)?;
+    let ty = value.type_info();
+    if !T::compatible(&ty) {
+        return Err(sqlx_core::Error::ColumnDecode {
+            index: name.into(),
+            source: format!("SQL type {ty} is incompatible with {}", T::type_info()).into(),
+        });
+    }
+    Option::<T>::decode(value).map_err(|source| sqlx_core::Error::ColumnDecode {
+        index: name.into(),
+        source,
+    })
 }
 
 /// SQL query argument value for binding to prepared statements.
@@ -258,23 +251,21 @@ impl SqlValue {
     /// Binds this value to SQLx query arguments.
     ///
     /// Unsigned and sub-16-bit integers are cast to the smallest signed type
-    /// supported by SQLx `Any` driver.
+    /// supported by the concrete PostgreSQL driver.
     ///
     /// # Errors
     ///
     /// Returns an error if the value cannot be bound to the arguments.
-    pub fn bind_to(
-        self,
-        arguments: &mut PgArguments,
-    ) -> std::result::Result<(), sqlx::error::BoxDynError> {
+    pub fn bind_to(self, arguments: &mut PgArguments) -> std::result::Result<(), BoxDynError> {
         match self {
             SqlValue::Int8(v) => arguments.add(v as i16)?,
             SqlValue::UInt8(v) => arguments.add(v as i16)?,
             SqlValue::UInt16(v) => arguments.add(v as i32)?,
             SqlValue::UInt32(v) => arguments.add(v as i64)?,
-            SqlValue::UInt64(v) => arguments.add(i64::try_from(v).map_err(|_| {
-                sqlx::error::BoxDynError::from(format!("UInt64 {v} exceeds i64::MAX"))
-            })?)?,
+            SqlValue::UInt64(v) => arguments.add(
+                i64::try_from(v)
+                    .map_err(|_| BoxDynError::from(format!("UInt64 {v} exceeds i64::MAX")))?,
+            )?,
             SqlValue::Int16(v) => arguments.add(v)?,
             SqlValue::Int32(v) => arguments.add(v)?,
             SqlValue::Int64(v) => arguments.add(v)?,

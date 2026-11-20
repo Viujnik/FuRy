@@ -1,81 +1,153 @@
 pub use super::field::FieldType;
+use crate::error::{FuryError, Result};
+use bincode::Options;
 use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Read;
+use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+const MAX_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MODELS: usize = 4096;
+const MAX_FIELDS: usize = 4096;
+const MAX_TYPE_DEPTH: usize = 16;
+#[cfg(not(target_arch = "wasm32"))]
 const REGISTRY_CACHE_FILE: &str = ".fury_registry.bin";
-
 static GLOBAL_REGISTRY: OnceLock<SchemaRegistry> = OnceLock::new();
 
-/// Returns a read-only static reference to the shared compilation schema registry.
-///
-/// This is the single source of truth for all environment layers.
+/// Returns the process-wide registry for this runtime.
 pub fn get_global_registry() -> &'static SchemaRegistry {
     GLOBAL_REGISTRY.get_or_init(SchemaRegistry::new)
 }
 
-/// Global registry for model schemas.
-///
-/// Thread-safe storage for all registered models. Uses `Arc<RwLock<>>` for
-/// concurrent read access with exclusive write access.
+/// Thread-safe runtime registry whose schemas are shared by readers.
 #[derive(Clone, Default)]
 pub struct SchemaRegistry {
     inner: Arc<RwLock<HashMap<String, Arc<ModelSchema>>>>,
 }
 
 impl SchemaRegistry {
-    /// Creates a registry hydrated from the on-disk cache (`.fury_registry.bin`
-    /// in the current working directory). On any read/parse failure — or on
-    /// platforms without a filesystem (WASM32) — the registry starts empty.
+    /// Loads the working-directory cache when present and valid.
     #[must_use]
     pub fn new() -> Self {
-        let mut map = HashMap::new();
-
-        if Path::new(REGISTRY_CACHE_FILE).exists() {
-            if let Ok(mut file) = File::open(REGISTRY_CACHE_FILE) {
-                let mut buf = Vec::new();
-                if file.read_to_end(&mut buf).is_ok() {
-                    if let Ok(schemas) = bincode::deserialize::<Vec<ModelSchema>>(&buf) {
-                        for mut schema in schemas {
-                            schema.field_index = ModelSchema::build_field_index(&schema.fields);
-                            map.insert(schema.name().to_string(), Arc::new(schema));
-                        }
-                    }
-                }
-            }
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(registry) = Self::load_from_file(REGISTRY_CACHE_FILE) {
+            return registry;
         }
+        Self::default()
+    }
 
-        Self {
-            inner: Arc::new(RwLock::new(map)),
+    /// Registers a valid model and attempts to persist the native cache.
+    pub fn register(&self, schema: ModelSchema) {
+        if let Err(error) = self.register_with_cache(schema, false) {
+            eprintln!("[fury] registration failed: {error}");
         }
     }
 
-    /// Registers a new model schema.
-    ///
-    /// If a schema with the same name already exists, it will be replaced.
-    pub fn register(&self, schema: ModelSchema) {
-        let name = schema.name().to_string();
-        let schema_arc = Arc::new(schema);
-
+    /// Registers a valid model. Ordinary runtime imports can work in a read-only directory.
+    pub fn register_with_cache(&self, mut schema: ModelSchema, require_cache: bool) -> Result<()> {
+        schema.validate()?;
+        schema.field_index = ModelSchema::build_field_index(&schema.fields);
         let mut map = self.inner.write();
-        map.insert(name, schema_arc);
-
-        let schemas_to_save: Vec<ModelSchema> = map.values().map(|arc| (**arc).clone()).collect();
-
-        if let Ok(encoded) = bincode::serialize(&schemas_to_save) {
-            let tmp = format!("{REGISTRY_CACHE_FILE}.tmp");
-            if fs::write(&tmp, &encoded).is_ok() {
-                if let Err(e) = fs::rename(&tmp, REGISTRY_CACHE_FILE) {
-                    eprintln!("[fury] registry persist failed: {e}");
+        if map.len() >= MAX_MODELS && !map.contains_key(schema.name()) {
+            return Err(invalid("too many schemas"));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let models = map
+                .values()
+                .map(Arc::as_ref)
+                .filter(|old| old.name() != schema.name())
+                .chain(std::iter::once(&schema));
+            let encoded = Self::encode_schemas(models)?;
+            if let Err(error) = write_cache(Path::new(REGISTRY_CACHE_FILE), &encoded) {
+                if require_cache {
+                    return Err(error);
                 }
-            } else {
-                eprintln!("[fury] registry persist failed: cannot write tmp file");
+                eprintln!("[fury] registry persist failed: {error}");
             }
         }
+        #[cfg(target_arch = "wasm32")]
+        if require_cache {
+            return Err(invalid("this platform has no registry cache file"));
+        }
+        map.insert(schema.name().to_owned(), Arc::new(schema));
+        Ok(())
+    }
+
+    /// Read an entire validated cache and then add or replace its entries atomically.
+    pub fn import_cache(&self, bytes: &[u8]) -> Result<()> {
+        let parsed = Self::decode_cache(bytes)?;
+        let mut map = self.inner.write();
+        let added = parsed
+            .iter()
+            .filter(|s| !map.contains_key(s.name()))
+            .count();
+        if added > MAX_MODELS - map.len() {
+            return Err(invalid("too many schemas"));
+        }
+        for schema in parsed {
+            map.insert(schema.name().to_owned(), Arc::new(schema));
+        }
+        Ok(())
+    }
+
+    /// Encode the canonical fixed-width cache for the selected models.
+    pub fn encode_schemas<'a>(
+        schemas: impl IntoIterator<Item = &'a ModelSchema>,
+    ) -> Result<Vec<u8>> {
+        let mut schemas: Vec<_> = schemas.into_iter().collect();
+        if schemas.len() > MAX_MODELS {
+            return Err(invalid("too many schemas"));
+        }
+        schemas.sort_by(|a, b| a.name().cmp(b.name()));
+        if schemas
+            .windows(2)
+            .any(|pair| pair[0].name() == pair[1].name())
+        {
+            return Err(invalid("duplicate model name"));
+        }
+        for schema in &schemas {
+            schema.validate()?;
+        }
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_REGISTRY_BYTES as u64)
+            .serialize(&schemas)
+            .map_err(|e| invalid(format!("registry encoding: {e}")))
+    }
+
+    fn decode_cache(bytes: &[u8]) -> Result<Vec<ModelSchema>> {
+        preflight_registry(bytes)?;
+        let mut schemas: Vec<ModelSchema> = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(MAX_REGISTRY_BYTES as u64)
+            .reject_trailing_bytes()
+            .deserialize(bytes)
+            .map_err(|e| invalid(format!("registry decoding: {e}")))?;
+        let mut names = HashSet::with_capacity(schemas.len());
+        for schema in &mut schemas {
+            schema.validate()?;
+            schema.field_index = ModelSchema::build_field_index(&schema.fields);
+            if !names.insert(schema.name().to_owned()) {
+                return Err(invalid("duplicate model name"));
+            }
+        }
+        Ok(schemas)
+    }
+
+    /// Load a validated native cache without changing the process-wide registry.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
+        use std::io::Read;
+        let file = std::fs::File::open(path).map_err(|e| invalid(format!("read registry: {e}")))?;
+        let mut bytes = Vec::new();
+        file.take((MAX_REGISTRY_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| invalid(format!("read registry: {e}")))?;
+        let registry = Self::default();
+        registry.import_cache(&bytes)?;
+        Ok(registry)
     }
 
     /// Retrieves a model schema by name.
@@ -115,15 +187,133 @@ impl SchemaRegistry {
     /// Returns a list of all registered model names.
     #[must_use]
     pub fn list_models(&self) -> Vec<String> {
-        let map = self.inner.read();
-        map.keys().cloned().collect()
+        let mut names: Vec<_> = self.inner.read().keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Returns a vector of all registered model schemas as Arc pointers.
     #[must_use]
     pub fn get_all_schemas(&self) -> Vec<Arc<ModelSchema>> {
-        self.inner.read().values().cloned().collect()
+        let mut schemas: Vec<_> = self.inner.read().values().cloned().collect();
+        schemas.sort_by(|a, b| a.name().cmp(b.name()));
+        schemas
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_cache(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let temp = path.with_file_name(format!(".fury-registry-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| invalid(format!("create registry temporary file: {e}")))?;
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = result.and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(|e| invalid(format!("save registry: {e}")))
+}
+
+/// Create a schema error with its diagnostic text.
+fn invalid(message: impl Into<Box<str>>) -> FuryError {
+    FuryError::InvalidSchema(message.into())
+}
+
+/// Check nested type depth and the names of referenced opaque objects.
+fn validate_type(ty: &FieldType, depth: usize) -> Result<()> {
+    if depth > MAX_TYPE_DEPTH {
+        return Err(invalid("schema nesting limit exceeded"));
+    }
+    match ty {
+        FieldType::List(inner) => validate_type(inner, depth + 1)?,
+        FieldType::Map(k, v) => {
+            validate_type(k, depth + 1)?;
+            validate_type(v, depth + 1)?;
+        }
+        FieldType::Object(name) if name.is_empty() || name.len() > 255 => {
+            return Err(invalid("invalid object schema name"))
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+// Wire representation of Vec<ModelSchema> (fixed-width bincode 1.x), excluding the skipped index.
+// Keep this scanner in sync with FieldType/FieldSchema and guard it with roundtrip tests.
+/// Walk the fixed-width bincode layout before deserialization can allocate it.
+fn preflight_registry(bytes: &[u8]) -> Result<()> {
+    if bytes.len() > MAX_REGISTRY_BYTES {
+        return Err(invalid("registry byte limit exceeded"));
+    }
+    struct Scan<'a> {
+        rest: &'a [u8],
+    }
+    impl<'a> Scan<'a> {
+        /// Advance the bounded scanner cursor and return the next exact byte range.
+        fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+            if n > self.rest.len() {
+                return Err(invalid("truncated registry"));
+            }
+            let (head, tail) = self.rest.split_at(n);
+            self.rest = tail;
+            Ok(head)
+        }
+        /// Read a fixed-width count and reject values over the caller's limit.
+        fn count(&mut self, max: usize) -> Result<usize> {
+            let n = u64::from_le_bytes(self.take(8)?.try_into().unwrap());
+            if n > max as u64 {
+                return Err(invalid("registry count or string limit exceeded"));
+            }
+            Ok(n as usize)
+        }
+        /// Read and validate a length-prefixed schema or field name.
+        fn name(&mut self) -> Result<()> {
+            let n = self.count(255)?;
+            if n == 0 {
+                return Err(invalid("empty schema or field name"));
+            }
+            std::str::from_utf8(self.take(n)?).map_err(|_| invalid("invalid registry UTF-8"))?;
+            Ok(())
+        }
+        /// Scan a field type by its bincode tag, recursing only into supported container shapes.
+        fn ty(&mut self, depth: usize) -> Result<()> {
+            if depth > MAX_TYPE_DEPTH {
+                return Err(invalid("schema nesting limit exceeded"));
+            }
+            match u32::from_le_bytes(self.take(4)?.try_into().unwrap()) {
+                0..=15 => Ok(()),
+                16 => self.ty(depth + 1),
+                17 => {
+                    self.ty(depth + 1)?;
+                    self.ty(depth + 1)
+                }
+                18 => self.name(),
+                _ => Err(invalid("unknown schema type")),
+            }
+        }
+    }
+    let mut s = Scan { rest: bytes };
+    let models = s.count(MAX_MODELS)?;
+    for _ in 0..models {
+        s.name()?;
+        let fields = s.count(MAX_FIELDS)?;
+        for _ in 0..fields {
+            s.name()?;
+            s.ty(0)?;
+            if s.take(1)?[0] > 1 {
+                return Err(invalid("invalid nullable flag"));
+            }
+        }
+    }
+    if !s.rest.is_empty() {
+        return Err(invalid("trailing registry bytes"));
+    }
+    Ok(())
 }
 
 /// Schema definition for a model.
@@ -150,6 +340,27 @@ impl ModelSchema {
             fields,
             field_index,
         }
+    }
+
+    /// Check model and field names, uniqueness, field count and nested type validity.
+    pub fn validate(&self) -> Result<()> {
+        if self.name.is_empty() || self.name.len() > 255 {
+            return Err(invalid("model name must contain 1..255 UTF-8 bytes"));
+        }
+        if self.fields.len() > MAX_FIELDS {
+            return Err(invalid("too many schema fields"));
+        }
+        let mut names = HashSet::with_capacity(self.fields.len());
+        for field in &self.fields {
+            if field.name.is_empty() || field.name.len() > 255 {
+                return Err(invalid("field name must contain 1..255 UTF-8 bytes"));
+            }
+            if !names.insert(field.name.as_str()) {
+                return Err(invalid(format!("duplicate field '{}'", field.name)));
+            }
+            validate_type(&field.field_type, 0)?;
+        }
+        Ok(())
     }
 
     /// Returns the model name.
@@ -188,8 +399,8 @@ impl ModelSchema {
     }
 
     // Helper function to eagerly compile a fast O(1) field lookup index.
-    // Called once inside the constructor during ModelSchema initialization.
-    fn build_field_index(fields: &[FieldSchema]) -> HashMap<String, usize> {
+    // Called from the constructor and from SchemaRegistry::register.
+    pub(crate) fn build_field_index(fields: &[FieldSchema]) -> HashMap<String, usize> {
         let mut index = HashMap::with_capacity(fields.len());
         for (i, field) in fields.iter().enumerate() {
             index.insert(field.name().to_string(), i);

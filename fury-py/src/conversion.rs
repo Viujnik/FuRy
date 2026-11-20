@@ -48,10 +48,19 @@ pub fn python_to_sql_value(obj: &Bound<'_, PyAny>) -> PyResult<SqlValue> {
 
     // После проверки PyBytes, перед UUID:
     let type_name: String = obj.get_type().name()?.extract()?;
-    let module: String = obj.get_type().getattr("__module__")?.extract().unwrap_or_default();
+    let module: String = obj
+        .get_type()
+        .getattr("__module__")?
+        .extract()
+        .unwrap_or_default();
 
     match (module.as_str(), type_name.as_str()) {
         ("datetime", "datetime") => {
+            if !obj.call_method0("utcoffset")?.is_none() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "datetime SQL arguments must be timezone-naive",
+                ));
+            }
             let year: i32 = obj.getattr("year")?.extract()?;
             let month: u32 = obj.getattr("month")?.extract()?;
             let day: u32 = obj.getattr("day")?.extract()?;

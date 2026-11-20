@@ -1,4 +1,5 @@
-use crate::encoder::value::ValueType;
+use super::limits::{DecodeBudget, DecodeLimits};
+use super::value::ValueType;
 use crate::error::{FuryError, Result};
 use crate::schema::registry::ModelSchema;
 use std::collections::HashMap;
@@ -6,329 +7,400 @@ use std::sync::Arc;
 
 const WIRE_MAGIC: u8 = b'F';
 const WIRE_VERSION: u8 = 2;
+const HEADER_SIZE: usize = 6;
+const ENTRY_HEADER_SIZE: usize = 5;
+const DENSE_INDEX_LIMIT: usize = 4096;
 
-const SIZE_LEN: usize = 4;
-const MAGIC_OFFSET: usize = SIZE_LEN;
-const VERSION_OFFSET: usize = SIZE_LEN + 1;
-const HEADER_SIZE: usize = SIZE_LEN + 2;
+// A frame fits in a u32. A value consumes at least one byte, so its nested
+// value count also fits. Entry offset zero belongs to the header.
+#[derive(Clone, Copy, Default)]
+struct Location {
+    entry: u32,
+    start: u32,
+    len: u32,
+    values: u32,
+}
 
-const NAME_LEN_SIZE: usize = 1;
-const VALUE_LEN_SIZE: usize = 4;
+impl Location {
+    fn entry_len(self) -> usize {
+        (self.start + self.len - self.entry) as usize
+    }
 
-/// A high-performance binary record with a dynamic schema.
+    fn coordinates(self) -> (usize, usize) {
+        (self.start as usize, self.len as usize)
+    }
+}
+
+struct Locations {
+    // Common known fields share the schema's name index without copying names.
+    dense: Vec<Location>,
+    sparse: HashMap<Box<str>, Location>,
+}
+
+impl Locations {
+    fn new(schema: &ModelSchema, limits: &DecodeLimits) -> Self {
+        Self {
+            dense: vec![
+                Location::default();
+                schema
+                    .fields_count()
+                    .min(limits.max_fields)
+                    .min(DENSE_INDEX_LIMIT)
+            ],
+            sparse: HashMap::new(),
+        }
+    }
+
+    fn get(&self, index: usize, name: &str) -> Option<Location> {
+        let location = self.dense.get(index).or_else(|| self.sparse.get(name))?;
+        (location.entry != 0).then_some(*location)
+    }
+
+    fn insert(&mut self, index: Option<usize>, name: &str, value: Location) -> Option<Location> {
+        if let Some(slot) = index.and_then(|i| self.dense.get_mut(i)) {
+            let previous = std::mem::replace(slot, value);
+            (previous.entry != 0).then_some(previous)
+        } else {
+            self.sparse.insert(name.into(), value)
+        }
+    }
+
+    fn remove(&mut self, index: usize, name: &str) {
+        if let Some(slot) = self.dense.get_mut(index) {
+            *slot = Location::default();
+        } else {
+            self.sparse.remove(name);
+        }
+    }
+}
+
+/// A typed record holding a contiguous FuRy wire-v2 frame.
 ///
-/// Stores fields sequentially in a flat byte array, providing ultra-fast,
-/// zero-copy field access by calculating boundaries during serialization.
-///
-/// # Format of buffer
-///
+/// Raw field bytes borrow the frame. Typed reads materialize a value.
 /// ```text
-/// [4 bytes: header (total size)][field1_data][field2_data]...
+/// [u32 LE frame size]['F'][2] ([u8 name length][name][u32 LE value length][value])*
 /// ```
-
 pub struct BinaryRecord {
     schema: Arc<ModelSchema>,
     buffer: Vec<u8>,
-    // Mapping from field name to its exact coordinates: (start_offset, length)
-    offsets: HashMap<String, (usize, usize)>,
-    is_finished: bool,
-    reopened: bool,
+    offsets: Locations,
+    finished: bool,
+    has_dead_entries: bool,
+    limits: DecodeLimits,
+    // Current fields, excluding entries a later update superseded.
+    live_bytes: usize,
+    live_values: usize,
+    live_fields: usize,
 }
 
 impl BinaryRecord {
-    /// Creates a new empty record with a pre-allocated memory buffer based on the schema.
+    /// Starts an empty record with the default wire budgets.
     #[must_use]
     pub fn new(schema: Arc<ModelSchema>) -> Self {
-        let fields_count = schema.fields_count();
-        let estimated_size = HEADER_SIZE
-            + schema
-                .fields()
-                .iter()
-                .map(|field| {
-                    NAME_LEN_SIZE
-                        + field.name().len()
-                        + VALUE_LEN_SIZE
-                        + match field.field_type().fixed_size() {
-                            Some(size) => 1 + size,
-                            None => 1 + 8,
-                        }
-                })
-                .sum::<usize>();
-        let mut buffer = Vec::with_capacity(estimated_size);
-        buffer.extend_from_slice(&[0u8; HEADER_SIZE]);
+        Self::new_with_limits(schema, DecodeLimits::default())
+    }
 
+    /// Starts an empty record with explicit wire budgets.
+    #[must_use]
+    pub fn new_with_limits(schema: Arc<ModelSchema>, limits: DecodeLimits) -> Self {
+        let estimated = schema
+            .fields()
+            .iter()
+            .take(limits.max_fields.min(DENSE_INDEX_LIMIT))
+            .map(|field| {
+                ENTRY_HEADER_SIZE
+                    + field.name().len().min(u8::MAX as usize)
+                    + 1
+                    + field.field_type().fixed_size().unwrap_or(8)
+            })
+            .sum::<usize>();
+        let mut buffer = Vec::with_capacity(
+            (estimated + HEADER_SIZE)
+                .min(limits.max_frame_bytes)
+                .min(64 * 1024),
+        );
+        buffer.extend_from_slice(&[0; HEADER_SIZE]);
+        let offsets = Locations::new(&schema, &limits);
         Self {
             schema,
             buffer,
-            offsets: HashMap::with_capacity(fields_count),
-            is_finished: false,
-            reopened: false,
+            offsets,
+            finished: false,
+            has_dead_entries: false,
+            limits,
+            live_bytes: HEADER_SIZE,
+            live_values: 0,
+            live_fields: 0,
         }
     }
 
-    fn write_entry(buf: &mut Vec<u8>, name: &str, value: &ValueType) -> Result<(usize, usize)> {
-        let name_bytes = name.as_bytes();
-        if name_bytes.len() > u8::MAX as usize {
-            return Err(FuryError::Encoding(
-                format!("field name '{name}' longer than 255 bytes").into(),
-            ));
-        }
-
-        buf.push(name_bytes.len() as u8);
-        buf.extend_from_slice(name_bytes);
-
-        let len_pos = buf.len();
-        buf.extend_from_slice(&[0u8; VALUE_LEN_SIZE]);
-        let value_start = buf.len();
-        value.write_to(buf);
-        let value_len = buf.len() - value_start;
-
-        buf[len_pos..len_pos + VALUE_LEN_SIZE].copy_from_slice(&(value_len as u32).to_le_bytes());
-
-        Ok((value_start, value_len))
-    }
-
-    fn fill_header(buf: &mut [u8]) {
-        let size = buf.len() as u32;
-        buf[0..SIZE_LEN].copy_from_slice(&size.to_le_bytes());
-        buf[MAGIC_OFFSET] = WIRE_MAGIC;
-        buf[VERSION_OFFSET] = WIRE_VERSION;
-    }
-
-    /// Serializes and appends a field value to the record buffer.
-    ///
-    /// # Errors
-    ///
-    /// * `FuryError::BufferAlreadyFinished` - If `finish()` has already been called on this record.
-    /// * `FuryError::FieldNotFound` - If the requested field name does not exist in the model schema.
+    /// Writes a field while the record is open for editing.
     pub fn set_field(&mut self, name: &str, value: ValueType) -> Result<()> {
-        if self.is_finished {
+        if self.finished {
             return Err(FuryError::BufferAlreadyFinished);
         }
+        self.update_field(name, value)
+    }
 
-        let field = self
+    /// Writes a field, opening a finished record on success.
+    /// Validation failure leaves the existing data and finished state intact.
+    pub fn update_field(&mut self, name: &str, value: ValueType) -> Result<()> {
+        let index = self
             .schema
-            .find_field(name)
+            .field_index(name)
             .ok_or_else(|| FuryError::FieldNotFound {
                 field: name.into(),
                 schema: self.schema.name().into(),
             })?;
+        let field = &self.schema.fields()[index];
+        if (value.is_none() && !field.is_nullable()) || !value.matches_type(field.field_type(), 0) {
+            return Err(FuryError::TypeMismatch {
+                field: name.into(),
+                expected: field.field_type().to_string().into(),
+                actual: "wrong value variant, nullability, depth or temporal precision".into(),
+            });
+        }
+        if name.len() > u8::MAX as usize {
+            return Err(FuryError::Encoding(
+                "field names can contain at most 255 bytes".into(),
+            ));
+        }
+        let (len, values) = value.encoded_size(&self.limits).ok_or_else(|| {
+            FuryError::Encoding("field exceeds the configured value budget".into())
+        })?;
+        let previous = self.offsets.get(index, name).unwrap_or_default();
+        let is_new = previous.entry == 0;
+        let entry_len = ENTRY_HEADER_SIZE + name.len();
+        let max_bytes = self.limits.max_frame_bytes.min(u32::MAX as usize);
+        let size_error = || FuryError::Encoding("record exceeds the configured byte budget".into());
+        let entry_len = entry_len.checked_add(len).ok_or_else(size_error)?;
+        let live_fields = self.live_fields + usize::from(is_new);
+        let live_bytes = (self.live_bytes - previous.entry_len())
+            .checked_add(entry_len)
+            .filter(|size| *size <= max_bytes)
+            .ok_or_else(size_error)?;
+        let live_values = self.live_values - previous.values as usize;
+        if live_fields > self.limits.max_fields
+            || values > self.limits.max_total_values - live_values
+        {
+            return Err(FuryError::Encoding(
+                "record exceeds the configured field or value budget".into(),
+            ));
+        }
 
-        let (start_offset, field_len) = Self::write_entry(&mut self.buffer, field.name(), &value)?;
-
-        self.offsets
-            .insert(field.name().to_string(), (start_offset, field_len));
-
+        // Byte and value preflights are complete. Compact obsolete entries
+        // before appending when keeping them would exceed the frame budget.
+        if entry_len > max_bytes - self.buffer.len() {
+            self.offsets.remove(index, name);
+            self.compact(live_bytes - entry_len);
+        } else {
+            self.has_dead_entries |= !is_new;
+        }
+        let entry = self.buffer.len() as u32;
+        self.buffer.push(name.len() as u8);
+        self.buffer.extend_from_slice(name.as_bytes());
+        self.buffer.extend_from_slice(&(len as u32).to_le_bytes());
+        let start = self.buffer.len() as u32;
+        value.write_to(&mut self.buffer);
+        self.offsets.insert(
+            Some(index),
+            name,
+            Location {
+                entry,
+                start,
+                len: len as u32,
+                values: values as u32,
+            },
+        );
+        self.live_bytes = live_bytes;
+        self.live_values = live_values + values;
+        self.live_fields = live_fields;
+        self.finished = false;
         Ok(())
     }
 
-    /// Returns a direct slice of raw bytes corresponding to the given field name.
-    ///
-    /// This operation is strictly $O(1)$ and executes without any memory allocations or data copying.
-    ///
-    /// Returns `Some(&[u8])` containing the raw field bytes if the field exists and has been
-    /// serialized, or `None` if the field name is not found in the record's offsets.
+    /// Borrows an encoded field payload for a field in the reader's schema.
     #[must_use]
     pub fn get_field_bytes(&self, name: &str) -> Option<&[u8]> {
-        let &(offset, len) = self.offsets.get(name)?;
-
-        self.buffer.get(offset..(offset + len))
+        let (start, len) = self.get_field_offset(name)?;
+        Some(&self.buffer[start..start + len])
     }
 
-    /// Retrieves and parses a field's raw bytes back into its typed `ValueType` representation.
-    ///
-    /// Returns `Some(ValueType)` if the field is found and its binary payload is successfully
-    /// deserialized into a valid system type.
-    ///
-    /// Returns `None` if the field name does not exist in the record, or if the raw byte
-    /// sequence is corrupted and fails the type verification layout.
+    /// Decodes a field according to the reader's schema. Missing fields return
+    /// None. Explicit nil in a nullable field returns Some(ValueType::None).
     #[must_use]
     pub fn get_field_value(&self, name: &str) -> Option<ValueType> {
-        let bytes = self.get_field_bytes(name)?;
-        let field = self.schema.find_field(name)?;
-        ValueType::from_bytes(bytes, &field.field_type())
+        let index = self.schema.field_index(name)?;
+        let (start, len) = self.offsets.get(index, name)?.coordinates();
+        ValueType::from_bytes_with_limits(
+            &self.buffer[start..start + len],
+            self.schema.fields()[index].field_type(),
+            &self.limits,
+        )
     }
 
-    /// Returns the byte coordinates of a field within the record buffer.
-    ///
-    /// Returns `Some((offset, length))` where:
-    /// - `offset` — starting byte position of the field in the buffer
-    /// - `length` — number of bytes occupied by the field
-    ///
-    /// Returns `None` if the field does not exist or has not been set.
+    /// Returns the current offset and length for a field in the reader's schema.
     pub fn get_field_offset(&self, name: &str) -> Option<(usize, usize)> {
-        self.offsets.get(name).copied()
+        let index = self.schema.field_index(name)?;
+        Some(self.offsets.get(index, name)?.coordinates())
     }
 
-    /// Finalizes the record.
-    ///
-    /// * Fresh build (BUILDING): buffer is already tight — writes the 4-byte
-    ///   header only. O(1).
-    /// * Mutated-after-parse (REOPENED): rebuilds the buffer field-by-field,
-    ///   dropping dead bytes left by overwritten fields. O(record size),
-    ///   paid once per finish, only on this path.
-    ///
-    /// # Errors
-    /// * `FuryError::BufferAlreadyFinished` — called twice.
+    /// Finalizes a record. An edit can compact previous entries without re-encoding any retained field.
     pub fn finish(&mut self) -> Result<&[u8]> {
-        if self.is_finished {
+        if self.finished {
             return Err(FuryError::BufferAlreadyFinished);
         }
-
-        if self.reopened {
-            self.rebuild_buffer()?;
-            self.reopened = false;
-        } else {
-            Self::fill_header(&mut self.buffer);
+        if self.live_bytes > self.limits.max_frame_bytes {
+            return Err(FuryError::Encoding(
+                "record exceeds the configured byte budget".into(),
+            ));
         }
-
-        self.is_finished = true;
+        if self.has_dead_entries {
+            self.compact(self.live_bytes);
+        }
+        let len = self.buffer.len() as u32;
+        self.buffer[..4].copy_from_slice(&len.to_le_bytes());
+        self.buffer[4..HEADER_SIZE].copy_from_slice(&[WIRE_MAGIC, WIRE_VERSION]);
+        self.finished = true;
         Ok(&self.buffer)
     }
 
-    /// Rebuilds the buffer tightly from current field values.
-    ///
-    /// Parses every SET field in schema order (via the codec) and re-serializes
-    /// it into a fresh buffer, then rewrites the header. Unset fields are skipped.
-    /// Pre-allocates with the old buffer length as an upper bound — no reallocations.
-    fn rebuild_buffer(&mut self) -> Result<()> {
-        let mut entries: Vec<(String, ValueType)> = Vec::with_capacity(self.offsets.len());
-        for field in self.schema.fields() {
-            if self.offsets.contains_key(field.name()) {
-                let value = self.get_field_value(field.name()).ok_or_else(|| {
-                    FuryError::Encoding(
-                        format!("corrupt field '{}' during repack", field.name()).into(),
-                    )
-                })?;
-                entries.push((field.name().to_string(), value));
-            }
+    // Each location currently points into the old frame. Disjoint live entry
+    // ranges remain valid while copying, and their positions are rewritten in place.
+    fn compact(&mut self, capacity: usize) {
+        let mut entries: Vec<_> = self
+            .offsets
+            .dense
+            .iter_mut()
+            .filter(|slot| slot.entry != 0)
+            .chain(self.offsets.sparse.values_mut())
+            .collect();
+        entries.sort_unstable_by_key(|location| location.entry);
+        let mut buffer = Vec::with_capacity(capacity);
+        buffer.extend_from_slice(&[0; HEADER_SIZE]);
+        for location in entries {
+            let prefix = location.start - location.entry;
+            let old = location.entry as usize;
+            let len = location.entry_len();
+            location.entry = buffer.len() as u32;
+            location.start = location.entry + prefix;
+            buffer.extend_from_slice(&self.buffer[old..old + len]);
         }
-
-        let mut buf: Vec<u8> = Vec::with_capacity(self.buffer.len());
-        buf.extend_from_slice(&[0u8; HEADER_SIZE]);
-        let mut offsets = HashMap::with_capacity(entries.len());
-        for (name, value) in &entries {
-            let (start, len) = Self::write_entry(&mut buf, name, value)?;
-            offsets.insert(name.clone(), (start, len));
-        }
-
-        Self::fill_header(&mut buf);
-
-        self.buffer = buf;
-        self.offsets = offsets;
-        Ok(())
+        self.buffer = buffer;
+        self.has_dead_entries = false;
     }
 
-    /// Returns the finalized raw byte payload of the entire record.
-    ///
-    /// # Errors
-    ///
-    /// * `FuryError::BufferNotFinished` - If called before freezing the record via `finish()`.
+    /// Returns a finished frame with the original received bytes or current edits.
     pub fn as_bytes(&self) -> Result<&[u8]> {
-        if !self.is_finished {
+        if !self.finished {
             return Err(FuryError::BufferNotFinished);
         }
         Ok(&self.buffer)
     }
 
-    /// Compiles a `BinaryRecord` layout directly from a raw network byte stream.
-    ///
-    /// # Memory & Safety
-    ///
-    /// Performs strict frame boundary validation to prevent memory safety violations
-    /// or integer overflow attacks during dynamic slice assignment.
-    ///
-    /// # Errors
-    ///
-    /// Returns `FuryError::InvalidSchema` if payload header constraints are broken.
+    /// Parses one complete wire-v2 frame using the default limits.
     pub fn from_raw_bytes(data: Vec<u8>, schema: &Arc<ModelSchema>) -> Result<Self> {
-        if data.len() < HEADER_SIZE {
-            return Err(FuryError::InvalidSchema(Box::from(
-                "Malformed packet stream: buffer size is below header requirements",
-            )));
+        Self::from_raw_bytes_with_limits(data, schema, DecodeLimits::default())
+    }
+
+    /// Parses one frame under explicit limits and validates known values
+    /// without materializing them. Unknown values are opaque.
+    pub fn from_raw_bytes_with_limits(
+        data: Vec<u8>,
+        schema: &Arc<ModelSchema>,
+        limits: DecodeLimits,
+    ) -> Result<Self> {
+        if data.len() > limits.max_frame_bytes {
+            return Err(FuryError::InvalidSchema("frame exceeds byte limit".into()));
+        }
+        let Some(([a, b, c, d, magic, version], mut rest)) =
+            data.split_first_chunk::<HEADER_SIZE>()
+        else {
+            return Err(FuryError::InvalidSchema("truncated frame header".into()));
+        };
+        if data.len() != u32::from_le_bytes([*a, *b, *c, *d]) as usize {
+            return Err(FuryError::InvalidSchema(
+                "frame length differs from the header".into(),
+            ));
+        }
+        if *magic != WIRE_MAGIC || *version != WIRE_VERSION {
+            return Err(FuryError::InvalidSchema(
+                "expected a FuRy wire-v2 frame".into(),
+            ));
         }
 
-        let total_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if data.len() != total_size {
-            return Err(FuryError::InvalidSchema(Box::from(format!(
-                "Integrity mismatch: payload frame size ({}) deviates from header declaration ({})",
-                data.len(),
-                total_size
-            ))));
-        }
+        let mut offsets = Locations::new(schema, &limits);
+        let mut budget = DecodeBudget::new(&limits);
+        let mut physical_fields = 0;
+        let mut live_fields = 0;
+        let mut live_values = 0;
+        let mut live_bytes = data.len();
+        let mut has_dead_entries = false;
+        while let Some((&name_len, tail)) = rest.split_first() {
+            if physical_fields >= limits.max_fields {
+                return Err(FuryError::InvalidSchema("frame exceeds field limit".into()));
+            }
+            physical_fields += 1;
+            let entry = data.len() - rest.len();
+            let (name, tail) = tail
+                .split_at_checked(usize::from(name_len))
+                .ok_or_else(|| FuryError::InvalidSchema("truncated field name".into()))?;
+            let name = std::str::from_utf8(name)
+                .map_err(|_| FuryError::InvalidSchema("invalid UTF-8 field name".into()))?;
+            let (raw_len, tail) = tail
+                .split_first_chunk::<4>()
+                .ok_or_else(|| FuryError::InvalidSchema("truncated field length".into()))?;
+            let len = u32::from_le_bytes(*raw_len);
+            let (raw, tail) = tail
+                .split_at_checked(len as usize)
+                .ok_or_else(|| FuryError::InvalidSchema("truncated field value".into()))?;
 
-        match (data[MAGIC_OFFSET], data[VERSION_OFFSET]) {
-            (WIRE_MAGIC, WIRE_VERSION) => {}
-            (WIRE_MAGIC, v) => {
-                return Err(FuryError::InvalidSchema(Box::from(format!(
-                    "Unsupported wire version {v} (this fury-core speaks v{WIRE_VERSION}). \
-                     Rebuild all Fury components from the same workspace revision."
-                ))))
+            let index = schema.field_index(name);
+            let before = budget.remaining;
+            if let Some(i) = index {
+                let field = &schema.fields()[i];
+                if (!field.is_nullable() && raw.first() == Some(&0))
+                    || !ValueType::validate_bytes(raw, field.field_type(), &mut budget)
+                {
+                    return Err(FuryError::InvalidSchema(
+                        format!("invalid value for field '{name}'").into(),
+                    ));
+                }
             }
-            _ => {
-                return Err(FuryError::InvalidSchema(Box::from(
-                    "Not a FuRy buffer: legacy header or foreign bytes",
-                )))
+            let values = before - budget.remaining;
+            let location = Location {
+                entry: entry as u32,
+                start: (entry + ENTRY_HEADER_SIZE + name.len()) as u32,
+                len,
+                values: values as u32,
+            };
+            if let Some(previous) = offsets.insert(index, name, location) {
+                has_dead_entries = true;
+                live_values -= previous.values as usize;
+                live_bytes -= previous.entry_len();
+            } else {
+                live_fields += 1;
             }
-        }
-
-        let mut offsets = HashMap::with_capacity(schema.fields_count());
-        let mut cursor = HEADER_SIZE;
-
-        while cursor < data.len() {
-            let name_len = data[cursor] as usize;
-            cursor += NAME_LEN_SIZE;
-            let name_end = cursor + name_len;
-            if name_end > data.len() {
-                return Err(FuryError::InvalidSchema(Box::from(
-                    "Unexpected EOB while reading field name",
-                )));
-            }
-            let name = std::str::from_utf8(&data[cursor..name_end])
-                .map_err(|_| FuryError::InvalidSchema(Box::from("Invalid UTF-8 field name")))?;
-            cursor = name_end;
-
-            if cursor + VALUE_LEN_SIZE > data.len() {
-                return Err(FuryError::InvalidSchema(Box::from(
-                    "Unexpected EOF while reading value length",
-                )));
-            }
-            let value_len = u32::from_le_bytes([
-                data[cursor],
-                data[cursor + 1],
-                data[cursor + 2],
-                data[cursor + 3],
-            ]) as usize;
-            cursor += VALUE_LEN_SIZE;
-            let value_start = cursor;
-            let value_end = value_start + value_len;
-            if value_end > data.len() {
-                return Err(FuryError::InvalidSchema(Box::from(format!(
-                    "Unexpected EOB while parsing field '{name}'"
-                ))));
-            }
-            if schema.find_field(name).is_some() {
-                offsets.insert(name.to_string(), (value_start, value_len));
-            }
-            cursor = value_end;
+            live_values += values;
+            rest = tail;
         }
 
         Ok(Self {
             buffer: data,
             offsets,
             schema: Arc::clone(schema),
-            is_finished: true,
-            reopened: false,
+            finished: true,
+            has_dead_entries,
+            limits,
+            live_bytes,
+            live_values,
+            live_fields,
         })
     }
 
-    /// Reopens a finished record for mutation.
-    ///
-    /// The next `finish()` rebuilds the buffer from scratch (compaction),
-    /// so overwritten fields leave NO dead bytes behind.
+    /// Opens a finished record for editing.
     pub fn reopen(&mut self) {
-        self.is_finished = false;
-        self.reopened = true;
+        self.finished = false;
     }
 
     #[must_use]
@@ -348,6 +420,6 @@ impl BinaryRecord {
 
     #[must_use]
     pub const fn is_finished(&self) -> bool {
-        self.is_finished
+        self.finished
     }
 }

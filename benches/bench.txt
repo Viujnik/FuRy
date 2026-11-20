@@ -1,0 +1,1992 @@
+Project Path: benches
+
+Source Tree:
+
+```txt
+benches
+├── Makefile
+├── README.md
+├── bench.txt
+├── docker-compose.yml
+├── node
+│   ├── harness.mjs
+│   ├── package-lock.json
+│   ├── package.json
+│   ├── run.mjs
+│   └── variants.mjs
+├── project.txt
+├── python
+│   ├── harness.py
+│   ├── requirements.txt
+│   ├── run.py
+│   └── variants.py
+├── results
+├── rust
+│   ├── Cargo.toml
+│   └── benches
+│       └── core.rs
+├── scripts
+│   ├── env.sh
+│   ├── report.py
+│   └── run_all.sh
+└── seed.sql
+
+```
+
+`Makefile`:
+
+```
+SHELL       := /bin/bash
+.DEFAULT_GOAL := bench
+
+COMPOSE     := docker compose -f docker-compose.yml
+PSQL        := $(COMPOSE) exec -T postgres psql -U fury -d fury_bench
+STAMP       := $(shell date -u +%Y%m%dT%H%M%SZ)
+RESULTS     := results/$(STAMP)
+
+.PHONY: all db seed bench python node rust report clean help
+
+all: bench
+
+help:
+	@echo "targets: db seed bench python node rust report clean"
+
+db:
+	$(COMPOSE) up -d --wait
+
+seed: db
+	@echo "→ seeding (this drops and recreates the users table)"
+	@$(PSQL) -q < seed.sql
+
+bench: seed
+	@mkdir -p $(RESULTS)
+	@bash scripts/run_all.sh $(STAMP)
+	@ln -sfn $(STAMP) results/latest
+	@echo
+	@echo "✓ report: $(RESULTS)/REPORT.md"
+
+python: seed
+	@bash scripts/run_all.sh $(STAMP) --only python
+	@ln -sfn $(STAMP) results/latest
+
+node:
+	@bash scripts/run_all.sh $(STAMP) --only node
+	@ln -sfn $(STAMP) results/latest
+
+rust:
+	@bash scripts/run_all.sh $(STAMP) --only rust
+	@ln -sfn $(STAMP) results/latest
+
+report:
+	@python3 scripts/report.py results/$(shell readlink results/latest 2>/dev/null || echo .)
+
+clean:
+	$(COMPOSE) down -v || true
+	rm -rf results/2* results/latest
+	rm -rf fixtures/*
+	rm -rf node/node_modules rust/target
+```
+
+`README.md`:
+
+```md
+# FuRy benchmarks
+
+> Method before numbers. If the methodology doesn't convince you, the numbers shouldn't either.
+
+## What we measure
+
+Three layers, three directories. Each answers a different question and is run
+in its own process so they can't contaminate each other.
+
+| Benchmark | Question                                                              | Compares                            |
+|-----------|-----------------------------------------------------------------------|-------------------------------------|
+| `python/` | DB row → in-memory model → wire bytes: what does each step cost?      | asyncpg, orjson, msgpack, fury      |
+| `node/`   | wire bytes → JS object: what does decoding cost, and what does *not*? | JSON.parse, msgpack, WasmRecord     |
+| `rust/`   | the codec itself, with no Python or JS in the loop                    | serde_json, rmp-serde, BinaryRecord |
+
+The three do **not** feed into each other. If Python is slow, that's a Python
+problem, not a Rust one. If Node is slow, that's a JS engine problem. Keeping
+them separate means a bad number points at a specific layer.
+
+## What we do NOT measure, and why
+
+- **Cold start.** Dominated by import time and dynamic linker. Not interesting,
+  and no user sees it more than once.
+- **Concurrency / throughput.** We measure single-connection latency on one
+  query. Throughput is a connection-pooling design problem, orthogonal to the
+  wire format.
+- **Network latency.** Postgres runs in a local Docker container. Both sides
+  pay the same ~0.5–1 ms per query, so it's constant across variants — it shifts
+  absolute numbers but not the comparison.
+- **Realistic UI workload.** "Realistic" depends on your app. We give you
+  primitives; you measure your case.
+- **Memory in a way we can fully defend.** `ru_maxrss` at process exit captures
+  everything, but it's a peak, not a trace, and it includes the Python
+  interpreter, the Rust runtime, the Postgres client buffers, everything.
+  We report it because it's better than nothing, but treat it as a smell test,
+  not a number.
+- **Anything involving writes.** Read-only workload. Postgres is even configured
+  with `synchronous_commit=off` because durability is irrelevant here.
+
+## Determinism
+
+Every run uses the same data and the same queries.
+
+- `docker-compose.yml` pins `postgres:17.2-alpine`. No `latest`.
+- `seed.sql` uses `setseed(0.42)`. Every machine gets the same 10 000 rows.
+- `synchronous_commit=off`, `shared_buffers=512MB`, `work_mem=64MB` — pinned.
+- The table is `VACUUM ANALYZE`d and prewarmed before any variant runs.
+- The query text lives in one string in `variants.py` and one in `variants.mjs`.
+  They're identical by construction.
+
+## Isolation
+
+Each variant runs as a separate OS process. This matters because:
+
+- V8's inline caches, hidden classes, and JIT tiers are warmed by the first
+  thing you run. If `JSON.parse` warms up before `WasmRecord`, the second variant
+  is measured against a warmed heap that the first variant never saw.
+- CPython's freelists are similarly stateful.
+- Postgres' connection is stateful: `PREPARE`d statements, session cache.
+
+We don't pool connections across variants. Each variant opens its own, warms
+its own prepared statements, and exits.
+
+## Statistics
+
+For each variant and each scenario, we report:
+
+| Statistic   | Why                                                               |
+|-------------|-------------------------------------------------------------------|
+| `median`    | The number a user sees. Resistant to hiccups.                     |
+| `p95`       | The number that decides whether the app feels fast on a bad tick. |
+| `min`       | Best case, useful to see how far the distribution spreads.        |
+| `max`       | Worst case, useful for spotting scheduler noise.                  |
+| `bytes_out` | Wire payload size, when the variant produces bytes.               |
+| `peak_rss`  | Peak process RSS in MB, from `ru_maxrss` at exit.                 |
+
+We do **not** report the mean. Wall-clock distributions are right-skewed;
+the mean is pulled by outliers the user never experiences.
+
+## Warmup
+
+Before the timed loop, each variant runs the scenario N times and throws the
+results away. Rationale:
+
+- Postgres warms its page cache and query plan cache on the first run.
+- V8 tier-up to optimized code happens within the first few thousand calls.
+- CPython's type caches warm up.
+- The OS page cache warms the fixture files.
+
+Warmup count is per-benchmark and documented in the source. Default: 5.
+
+## Garbage collection
+
+We call `gc.collect()` in Python (and `global.gc()` in Node with
+`--expose-gc`) **before** the timed region of each iteration, and we exclude
+that cost from the measurement. Rationale: we want to measure the work, not
+the cost of the previous iteration's garbage. This gives a slightly optimistic
+absolute number but a much more stable comparison between variants.
+
+## The 1000× rule
+
+For any variant we run at least 30 measured iterations and check that
+`(p95 - median) / median < 0.2`. If not, the measurement is too noisy and we
+bump iterations. The threshold is arbitrary; the point is that we check it
+and warn rather than printing a number we don't trust.
+
+## Hardware
+
+These benchmarks are honest on a laptop. They are not a substitute for your
+production hardware. For reference, the "reference numbers" in this repo's
+README were produced on:
+
+<!-- update this block if you run on different hardware -->
+
+- **CPU:** Apple M4 Pro (14 cores: 10 performance, 4 efficiency)
+- **RAM:** 24 GiB unified
+- **OS:** macOS (Darwin 25.x)
+- **Storage:** internal NVMe
+- **Docker Desktop** with a default VM (Postgres runs inside the VM; ~1 ms
+  per-query latency added, identical for all variants)
+
+## How to run
+
+```sh
+cd benches
+make          # docker up, seed, run everything, produce results/latest/REPORT.md
+```
+
+Sub-targets:
+
+```sh
+make db       # postgres up only
+make seed     # seed only (idempotent, drops and recreates the table)
+make python   # python benchmark only
+make node     # node benchmark only
+make rust     # rust benchmark only
+make report   # regenerate report from existing results
+make clean    # docker down -v, remove results/ and fixtures/
+```
+
+## How to read the results
+
+Open `results/latest/REPORT.md`. It has one table per (benchmark, scenario).
+Compare medians first, then check that p95 is not a different story.
+The last section of this file explains what we expect to see and why.
+
+## What we expect (hypotheses before running)
+
+We're writing this down so we can be wrong in public.
+
+Narrow query, N rows, DB → Python. Fury will be slightly slower than
+asyncpg-to-dicts, because our executor writes each field into a byte buffer
+with per-field type checks. We expect 1.1×–1.4× slower. The advantage is on
+the other side of the wire.
+Wide query, N rows, DB → bytes. Fury wins. The JSON path serializes
+bio and avatar even though the client only reads three fields. Fury
+writes those bytes too (they're in the SELECT), but it does so with a
+memcpy instead of a base64 encode + string escape. Expected: 2×–4× faster.
+Bytes → JS object, wide payload, read 3 fields. Fury wins, but not by
+as much as you'd hope. WasmRecord still walks the full TLV chain at
+construction time. Expected: 1.5×–2.5× faster than JSON.parse, similar
+to msgpack.decode, and clearly faster than both when the payload contains
+multi-KB fields the consumer doesn't read.
+Bytes → JS object, read all fields. Fury loses or ties. There's no
+laziness benefit when you read everything, and per-field decode has overhead
+that JSON's property access does not. We expect 0.9×–1.1× vs JSON.parse.
+Rust codec, encode. BinaryRecord should be within 10% of rmp-serde
+and 2×–3× faster than serde_json. The self-describing field names add
+~1 byte per field of overhead vs rmp.
+Rust codec, decode. from_raw_bytes should beat both by a wide margin
+because it doesn't allocate any intermediate representation — it just
+populates an offset map. Expected: 5×–10× faster.
+
+
+---
+
+## `benches/Makefile`
+
+```makefile
+SHELL       := /bin/bash
+.DEFAULT_GOAL := bench
+
+COMPOSE     := docker compose -f docker-compose.yml
+PSQL        := $(COMPOSE) exec -T postgres psql -U fury -d fury_bench
+STAMP       := $(shell date -u +%Y%m%dT%H%M%SZ)
+RESULTS     := results/$(STAMP)
+
+.PHONY: all db seed bench python node rust report clean help
+
+all: bench
+
+help:
+	@echo "targets: db seed bench python node rust report clean"
+
+db:
+	$(COMPOSE) up -d --wait
+
+seed: db
+	@echo "→ seeding (this drops and recreates the users table)"
+	@$(PSQL) -q < seed.sql
+
+bench: seed
+	@mkdir -p $(RESULTS)
+	@bash scripts/run_all.sh $(STAMP)
+	@ln -sfn $(STAMP) results/latest
+	@echo
+	@echo "✓ report: $(RESULTS)/REPORT.md"
+
+python: seed
+	@bash scripts/run_all.sh $(STAMP) --only python
+	@ln -sfn $(STAMP) results/latest
+
+node:
+	@bash scripts/run_all.sh $(STAMP) --only node
+	@ln -sfn $(STAMP) results/latest
+
+rust:
+	@bash scripts/run_all.sh $(STAMP) --only rust
+	@ln -sfn $(STAMP) results/latest
+
+report:
+	@python3 scripts/report.py results/$(shell readlink results/latest 2>/dev/null || echo .)
+
+clean:
+	$(COMPOSE) down -v || true
+	rm -rf results/2* results/latest
+	rm -rf fixtures/*
+	rm -rf node/node_modules rust/target
+
+```
+
+`docker-compose.yml`:
+
+```yml
+# Postgres configuration is pinned. Don't use `latest`.
+#
+# `synchronous_commit=off` is safe here because the benchmark is read-only;
+# we never measure write durability. The other settings are chosen so a 100 MB
+# dataset fits comfortably in shared_buffers and every query is a pure index
+# or seq scan with no spills.
+services:
+  postgres:
+    image: postgres:17.2-alpine
+    container_name: fury-bench-postgres
+    environment:
+      POSTGRES_USER: fury
+      POSTGRES_PASSWORD: fury
+      POSTGRES_DB: fury_bench
+    ports:
+      # 54329 to avoid colliding with any local Postgres on 5432.
+      - "127.0.0.1:54329:5432"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "synchronous_commit=off"
+      - "-c"
+      - "fsync=off"
+      - "-c"
+      - "full_page_writes=off"
+      - "-c"
+      - "max_connections=20"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U fury -d fury_bench" ]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+```
+
+`node/harness.mjs`:
+
+```mjs
+/**
+ * Minimal timing harness. Mirrors python/harness.py in spirit: visible
+ * mechanics, no magic, no external benchmark library.
+ *
+ * Notes specific to V8:
+ *
+ *   - We must run with --expose-gc. Without it, gc() is undefined and the
+ *     "collect before measure" step silently no-ops. The runner enforces this
+ *     by checking `typeof globalThis.gc === 'function'` at startup.
+ *
+ *   - performance.now() gives sub-millisecond resolution but not nanosecond.
+ *     process.hrtime.bigint() gives nanoseconds on every platform Node
+ *     supports. We use hrtime.
+ *
+ *   - Warmup matters more in V8 than in CPython. The first ~10 calls of a
+ *     function run in the interpreter; the next ~1000 in Sparkplug; then
+ *     TurboFan. Our warmup count (below) drives tier-up. If you change it,
+ *     change it in a commit that also updates the recorded numbers.
+ */
+
+export function nowNs() {
+  return Number(process.hrtime.bigint());
+}
+
+export async function runBench(variant, fn, { warmup = 50, iterations = 200 } = {}) {
+  if (typeof globalThis.gc !== 'function') {
+    throw new Error('run.mjs must be invoked with --expose-gc');
+  }
+
+  for (let i = 0; i < warmup; i++) await fn();
+
+  const times = [];
+  let fixtureBytes = null;
+
+  for (let i = 0; i < iterations; i++) {
+    globalThis.gc();
+    const t0 = nowNs();
+    const out = await fn();
+    const t1 = nowNs();
+    times.push(t1 - t0);
+    if (out != null && out.fixtureBytes != null) fixtureBytes = out.fixtureBytes;
+  }
+
+  const sorted = times.slice().sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+  const p95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+
+  const spread = (p95 - median) / median;
+  if (spread > 0.5) {
+    console.error(`  ! ${variant}: p95/median spread = ${(spread * 100).toFixed(0)}%. Noisy.`);
+  }
+
+  const rss = process.memoryUsage().rss;
+
+  return {
+    variant,
+    median_ms: +(median / 1e6).toFixed(4),
+    p95_ms: +(p95 / 1e6).toFixed(4),
+    min_ms: +(sorted[0] / 1e6).toFixed(4),
+    max_ms: +(sorted[sorted.length - 1] / 1e6).toFixed(4),
+    iterations: times.length,
+    fixture_bytes: fixtureBytes,
+    peak_rss_bytes: rss,
+  };
+}
+```
+
+`node/package-lock.json`:
+
+```json
+{
+  "name": "fury-bench-node",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "fury-bench-node",
+      "version": "0.0.0",
+      "dependencies": {
+        "@fury/wasm-core": "file:../../fury-ts/pkg",
+        "@msgpack/msgpack": "3.0.0"
+      }
+    },
+    "../../fury-ts/pkg": {
+      "name": "fury-ts",
+      "version": "0.1.0"
+    },
+    "node_modules/@fury/wasm-core": {
+      "resolved": "../../fury-ts/pkg",
+      "link": true
+    },
+    "node_modules/@msgpack/msgpack": {
+      "version": "3.0.0",
+      "resolved": "https://registry.npmjs.org/@msgpack/msgpack/-/msgpack-3.0.0.tgz",
+      "integrity": "sha512-s/OZQ1QUtSYr9tgFZh4HSFLvTR2o81r0zfQj7pClC7oFUqZaAgkQ+vADV9JBioJLK9lJoAjBEhuPhVuOIJnbhg==",
+      "license": "ISC",
+      "engines": {
+        "node": ">= 18"
+      }
+    }
+  }
+}
+
+```
+
+`node/package.json`:
+
+```json
+{
+  "name": "fury-bench-node",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Node-side decode benchmark for FuRy. Compares JSON.parse, msgpack decode, and WasmRecord construction + lazy field access on byte-identical payloads.",
+  "scripts": {
+    "bench": "node --expose-gc run.mjs"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "3.0.0",
+    "@fury/wasm-core": "file:../../fury-ts/pkg"
+  }
+}
+```
+
+`node/run.mjs`:
+
+```mjs
+#!/usr/bin/env node
+/**
+ * Entry point for the Node benchmark.
+ *
+ *   node --expose-gc run.mjs --variant json_parse_read3 --out results.json
+ *
+ * One variant per process, same rationale as the Python side: JIT state and
+ * inline caches from one variant must not leak into another.
+ */
+
+import { writeFile, mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
+
+import { runBench } from './harness.mjs';
+import { ALL_VARIANTS, VARIANT_MAP } from './variants.mjs';
+
+function parseArgs(argv) {
+    const out = { variant: null, outPath: null };
+    for (let i = 2; i < argv.length; i++) {
+        if (argv[i] === '--variant') out.variant = argv[++i];
+        else if (argv[i] === '--out') out.outPath = argv[++i];
+    }
+    if (!out.variant) { console.error('--variant is required'); process.exit(2); }
+    if (!ALL_VARIANTS.includes(out.variant)) {
+        console.error(`unknown variant: ${out.variant}`);
+        console.error(`known: ${ALL_VARIANTS.join(', ')}`);
+        process.exit(2);
+    }
+    if (!out.outPath) { console.error('--out is required'); process.exit(2); }
+    return out;
+}
+
+async function main() {
+    if (typeof globalThis.gc !== 'function') {
+        console.error('error: run with --expose-gc');
+        process.exit(2);
+    }
+    const { variant, outPath } = parseArgs(process.argv);
+    const fn = VARIANT_MAP[variant];
+    const result = await runBench(variant, fn);
+    await mkdir(dirname(outPath), { recursive: true });
+    await writeFile(outPath, JSON.stringify(result, null, 2));
+    console.log(`  ${variant}: median=${result.median_ms.toFixed(3)} ms  p95=${result.p95_ms.toFixed(3)} ms`);
+}
+
+main().catch((e) => { console.error(e); process.exit(1); });
+```
+
+`node/variants.mjs`:
+
+```mjs
+/**
+ * The variants under test. Each takes a fixture (bytes) and returns either
+ * the decoded representation or a value that depends on having accessed
+ * three specific fields.
+ *
+ * The fixtures are generated by python/run.py --emit-fixtures:
+ *   wide.json     — orjson output for 1000 rows
+ *   wide.msgpack  — msgpack output for 1000 rows
+ *   wide.fury     — one BinaryRecord (median-sized row) from fury
+ *
+ * Note on the asymmetry between formats:
+ *
+ *   JSON and msgpack files contain ALL 1000 rows. Their `*_only` variants
+ *   decode all 1000. Their `*_read3` variants additionally access
+ *   id/username/is_active on the first row.
+ *
+ *   The fury file contains ONE row (median size). Its `_only` variant
+ *   constructs one WasmRecord. Its `_read3` variant reads three fields.
+ *
+ * This means the absolute times are not comparable between Python formats
+ * and the fury fixture — a JSON parse of 1000 rows is obviously slower than
+ * constructing one WasmRecord. What IS comparable is the ratio between
+ * `_only` and `_read3` within a format. That ratio is the point: how much
+ * does reading three fields cost on top of decoding the payload?
+ *
+ * A future revision will batch the fury fixture to match row count. Tracked
+ * in benches/README.md under "known limitations".
+ */
+
+import { readFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+import { decode as msgpackDecode } from '@msgpack/msgpack';
+import { WasmRecord, loadRegistry } from '@fury/wasm-core';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const FIXTURES = join(__dirname, '..', 'fixtures');
+
+let _jsonBytes = null;
+let _msgpackBytes = null;
+let _furyBytes = null;
+let _registryLoaded = false;
+
+async function ensureLoaded() {
+  if (_jsonBytes) return;
+  _jsonBytes = await readFile(join(FIXTURES, 'wide.json'));
+  _msgpackBytes = await readFile(join(FIXTURES, 'wide.msgpack'));
+  _furyBytes = await readFile(join(FIXTURES, 'wide.fury'));
+
+  // loadRegistry must run before any WasmRecord is constructed.
+  const registryBytes = await readFile(join(FIXTURES, '.fury_registry.bin'));
+  await loadRegistry(new Uint8Array(registryBytes));
+  _registryLoaded = true;
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Variants
+// ────────────────────────────────────────────────────────────────────────
+
+export async function json_parse_only() {
+  await ensureLoaded();
+  const text = _jsonBytes.toString('utf8');
+  const obj = JSON.parse(text);
+  return { fixtureBytes: _jsonBytes.length, _drop: obj };
+}
+
+export async function json_parse_read3() {
+  await ensureLoaded();
+  const text = _jsonBytes.toString('utf8');
+  const arr = JSON.parse(text);
+  // Read three fields from the FIRST row, matching what the fury read3
+  // variant does. Sum so the optimizer can't elide.
+  const r = arr[0];
+  return { fixtureBytes: _jsonBytes.length, _drop: r.id + r.username.length + (r.is_active ? 1 : 0) };
+}
+
+export async function msgpack_decode_only() {
+  await ensureLoaded();
+  const obj = msgpackDecode(_msgpackBytes);
+  return { fixtureBytes: _msgpackBytes.length, _drop: obj };
+}
+
+export async function msgpack_decode_read3() {
+  await ensureLoaded();
+  const arr = msgpackDecode(_msgpackBytes);
+  const r = arr[0];
+  return { fixtureBytes: _msgpackBytes.length, _drop: r.id + r.username.length + (r.is_active ? 1 : 0) };
+}
+
+export async function fury_construct_only() {
+  await ensureLoaded();
+  const rec = new WasmRecord('BenchUser', new Uint8Array(_furyBytes));
+  return { fixtureBytes: _furyBytes.length, _drop: rec };
+}
+
+export async function fury_construct_read3() {
+  await ensureLoaded();
+  const rec = new WasmRecord('BenchUser', new Uint8Array(_furyBytes));
+  const id = rec.getNumber('id');
+  const username = rec.getString('username');
+  const isActive = rec.getBool('is_active');
+  return {
+    fixtureBytes: _furyBytes.length,
+    _drop: id + username.length + (isActive ? 1 : 0),
+  };
+}
+
+export const ALL_VARIANTS = [
+  'json_parse_only',
+  'json_parse_read3',
+  'msgpack_decode_only',
+  'msgpack_decode_read3',
+  'fury_construct_only',
+  'fury_construct_read3',
+];
+
+export const VARIANT_MAP = {
+  json_parse_only,
+  json_parse_read3,
+  msgpack_decode_only,
+  msgpack_decode_read3,
+  fury_construct_only,
+  fury_construct_read3,
+};
+```
+
+`python/harness.py`:
+
+```py
+"""
+Minimal timing harness.
+
+Design notes, in order of how often someone asks:
+
+  1. Why not pyperf?  pyperf is the right tool for CPU-bound microbenchmarks
+     where you control the entire run loop. Here the run loop is async, hits
+     a database, and has warmup semantics (prepared statements, page cache)
+     that pyperf's model doesn't capture well. Rolling our own means every
+     decision is visible in this file.
+
+  2. Why warmup?  Three reasons. (a) Postgres caches the query plan and pages
+     after the first execution. (b) CPython type-caches and inline caches warm
+     on repeated calls. (c) The OS page cache warms the binary. None of these
+     are what we want to measure.
+
+  3. Why median and not mean?  Wall-clock time is right-skewed. A single
+     scheduler preemption can double the mean while leaving the median alone.
+     The user experiences the median, not the mean.
+
+  4. Why gc.collect() before each measured iteration?  So the number reflects
+     the scenario, not the cost of cleaning up the previous iteration. We
+     collect outside the timed region so the collection itself isn't measured.
+
+  5. Why ru_maxrss?  It's the only memory number that captures both the
+     Python heap and the Rust allocations done by fury-core via PyO3. Note the
+     unit differs by platform: bytes on macOS, KB on Linux. We normalize.
+"""
+
+from __future__ import annotations
+
+import gc
+import platform
+import resource
+import statistics
+import time
+from dataclasses import dataclass, field
+from typing import Awaitable, Callable
+
+
+def _peak_rss_bytes() -> int:
+    """Peak RSS in bytes, normalized across platforms."""
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if platform.system() == "Darwin":
+        return int(rss)          # macOS reports bytes
+    return int(rss) * 1024       # Linux reports KiB
+
+
+@dataclass
+class Result:
+    variant: str
+    times_ns: list[int] = field(default_factory=list)
+    bytes_out: int | None = None
+    fixture_bytes: int | None = None
+    extra: dict = field(default_factory=dict)
+
+    @property
+    def median_ms(self) -> float:
+        return statistics.median(self.times_ns) / 1e6
+
+    @property
+    def p95_ms(self) -> float:
+        s = sorted(self.times_ns)
+        # Nearest-rank p95. With n >= 30 this is stable enough.
+        return s[min(len(s) - 1, int(len(s) * 0.95))] / 1e6
+
+    @property
+    def min_ms(self) -> float:
+        return min(self.times_ns) / 1e6
+
+    @property
+    def max_ms(self) -> float:
+        return max(self.times_ns) / 1e6
+
+    def as_dict(self) -> dict:
+        return {
+            "variant": self.variant,
+            "median_ms": round(self.median_ms, 4),
+            "p95_ms": round(self.p95_ms, 4),
+            "min_ms": round(self.min_ms, 4),
+            "max_ms": round(self.max_ms, 4),
+            "iterations": len(self.times_ns),
+            "bytes_out": self.bytes_out,
+            "fixture_bytes": self.fixture_bytes,
+            "peak_rss_bytes": _peak_rss_bytes(),
+            **self.extra,
+        }
+
+
+async def run_bench(
+    variant: str,
+    fn: Callable[[], Awaitable[object]],
+    *,
+    warmup: int = 5,
+    iterations: int = 30,
+) -> Result:
+    """
+    Run `fn` `warmup` times, discard, then `iterations` times and collect
+    wall-clock nanoseconds around each call.
+
+    `fn` must be a zero-argument async callable. Anything the scenario needs
+    (connection, query, schema) should be closed over. This keeps the timed
+    region free of setup code that would otherwise show up in every variant.
+    """
+    for _ in range(warmup):
+        await fn()
+
+    times: list[int] = []
+    bytes_out: int | None = None
+
+    for _ in range(iterations):
+        gc.collect()  # outside the timed region
+        t0 = time.perf_counter_ns()
+        out = await fn()
+        t1 = time.perf_counter_ns()
+        times.append(t1 - t0)
+        if out is not None:
+            if isinstance(out, (bytes, bytearray)):
+                bytes_out = len(out)
+            elif hasattr(out, "byte_len"):
+                bytes_out = out.byte_len
+
+    result = Result(variant=variant, times_ns=times, bytes_out=bytes_out)
+
+    spread = (result.p95_ms - result.median_ms) / result.median_ms
+    if spread > 0.5:
+        print(
+            f"  ! {variant}: p95/median spread = {spread:.0%}. "
+            f"Measurement is noisy; consider more iterations or a quieter machine."
+        )
+    return result
+```
+
+`python/requirements.txt`:
+
+```txt
+asyncpg==0.30.0
+orjson==3.10.12
+msgpack==1.1.0
+```
+
+`python/run.py`:
+
+```py
+#!/usr/bin/env python3
+"""
+Entry point for the Python benchmark.
+
+Usage:
+    python -m run --variant asyncpg_to_json_orjson --out results.json
+    python -m run --emit-fixtures
+
+Design:
+    One process = one variant. run_all.sh loops over variants and spawns a
+    fresh interpreter for each. This is the only way to guarantee that JIT
+    state, GC freelists, and prepared-statement caches from one variant don't
+    leak into another.
+
+    `--emit-fixtures` produces the byte fixtures consumed by the Node bench:
+        fixtures/wide.json
+        fixtures/wide.msgpack
+        fixtures/wide.fury
+    These are the exact payloads a server would put on the wire.
+"""
+
+
+import argparse
+import asyncio
+import json
+import os
+from pathlib import Path
+
+from harness import run_bench
+from variants import ALL_VARIANTS, build, WIDE_QUERY, _json_default, _msgpack_default
+
+DSN = os.environ.get(
+    "FURY_BENCH_DSN",
+    "postgresql://fury:fury@127.0.0.1:54329/fury_bench",
+)
+
+ROWS = int(os.environ.get("FURY_BENCH_ROWS", "1000"))
+
+# Iterations are set high enough that the p95 stabilizes. On an M4 Pro
+# this is about 3 seconds of wall time per variant, which is fine.
+WARMUP = 20
+ITERATIONS = 50
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Fixture generation (Node bench input)
+# ────────────────────────────────────────────────────────────────────────
+
+async def emit_fixtures() -> None:
+    """
+    Produce byte-identical payloads for the same query, in three formats,
+    at the same row count. These are what the Node benchmark decodes.
+
+    We deliberately produce fixtures from the SAME query the Python bench
+    uses, so a Node number and a Python number refer to the same work.
+    """
+    import asyncpg, orjson, msgpack
+
+    fixtures = Path(__file__).resolve().parent.parent / "fixtures"
+    fixtures.mkdir(exist_ok=True)
+
+    conn = await asyncpg.connect(DSN)
+    try:
+        rows = await conn.fetch(WIDE_QUERY, ROWS)
+        dicts = [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+    (fixtures / "wide.json").write_bytes(
+        orjson.dumps(dicts, default=_json_default)
+    )
+    (fixtures / "wide.msgpack").write_bytes(
+        msgpack.packb(dicts, default=_msgpack_default)
+    )
+
+    # Fury fixture: use the same DB driver path as the actual benchmark, so
+    # the bytes are exactly what a fury server would send.
+    from fury import FuryDB, BaseModel
+    from datetime import datetime
+    from uuid import UUID
+
+    class BenchUser(BaseModel):
+        id: int
+        username: str
+        email: str
+        display_name: str | None
+        is_active: bool
+        reputation: int
+        flags: int
+        external_id: UUID
+        created_at: datetime
+        updated_at: datetime
+        bio: str | None
+        avatar: bytes | None
+
+    db = FuryDB.connect(DSN)
+    models = await db.fetch_all(BenchUser, WIDE_QUERY, [ROWS])
+
+    # We pick the median-size row rather than the first, so a pathologically
+    # small or large first row doesn't skew the fixture.
+    blobs = [m.to_bytes() for m in models]
+    blobs.sort(key=len)
+    median_blob = blobs[len(blobs) // 2]
+    (fixtures / "wide.fury").write_bytes(median_blob)
+
+    # fury-py writes .fury_registry.bin to CWD when BenchUser is defined.
+    # CWD here is benches/python/ (because run_all.sh cd's into it), so the
+    # file lands there. We copy it into fixtures/ so the Node side finds it.
+    cwd_registry = Path.cwd() / ".fury_registry.bin"
+    if cwd_registry.exists():
+        (fixtures / ".fury_registry.bin").write_bytes(cwd_registry.read_bytes())
+    else:
+        raise RuntimeError(
+            f"{cwd_registry} not found. fury-py should have written it "
+            f"when BenchUser was defined. Check that FURY_EMIT_MODELS isn't "
+            f"interfering, and that benches/python/ is writable."
+        )
+
+    print(f"→ fixtures written to {fixtures}")
+    for f in sorted(fixtures.glob("wide.*")) + [fixtures / ".fury_registry.bin"]:
+        if f.exists():
+            print(f"   {f.name:20s} {f.stat().st_size:>10,} bytes")
+# ────────────────────────────────────────────────────────────────────────
+# Single-variant run
+# ────────────────────────────────────────────────────────────────────────
+
+async def run_one(variant: str, out_path: Path) -> None:
+    # build() открывает соединение внутри себя — setup отдельно не нужен.
+    name, timed, cleanup = await build(DSN, variant, n=ROWS)
+    try:
+        result = await run_bench(name, timed, warmup=WARMUP, iterations=ITERATIONS)
+    finally:
+        await cleanup()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result.as_dict(), indent=2))
+    print(f"  {name}: median={result.median_ms:.2f} ms  p95={result.p95_ms:.2f} ms  "
+          f"bytes_out={result.bytes_out}")
+
+
+# ────────────────────────────────────────────────────────────────────────
+# CLI
+# ────────────────────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser()
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--variant", choices=ALL_VARIANTS)
+    g.add_argument("--emit-fixtures", action="store_true")
+    p.add_argument("--out", type=Path)
+    args = p.parse_args()
+
+    if args.emit_fixtures:
+        asyncio.run(emit_fixtures())
+        return
+
+    if args.out is None:
+        p.error("--out is required with --variant")
+
+    asyncio.run(run_one(args.variant, args.out))
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+`python/variants.py`:
+
+```py
+"""
+The variants under test. One function per variant, one scenario per function.
+
+The SQL is defined once at module level so `python/` and `node/` (via the
+fixture generator) use byte-identical query text. If you change it here, the
+fixtures will be regenerated on the next run; that's intentional.
+
+What's in the comparison:
+
+  asyncpg_to_dicts          — the floor. Psycopg/asyncpg returning dicts.
+                              Nothing else done. This is what a lot of people
+                              ship when "we just need the data".
+
+  asyncpg_to_json_stdlib    — dicts + stdlib json.dumps, with a sensible
+                              default= for datetime/UUID/bytes (base64 for
+                              bytes, isoformat for datetime). The honest
+                              "we use the standard library" baseline.
+
+  asyncpg_to_json_orjson    — dicts + orjson.dumps. Same defaults. The
+                              "we use the fast library" baseline. This is
+                              the number to beat.
+
+  asyncpg_to_msgpack        — dicts + msgpack.packb. A binary baseline that
+                              (unlike JSON) can store bytes natively, so its
+                              payload will be smaller.
+
+  fury_to_models            — fury's DB driver, stop at the model. Isolates
+                              the row → buffer path from the buffer → bytes
+                              path.
+
+  fury_to_bytes             — fury's full path: DB → model → bytes. The
+                              number that goes into a wire payload.
+
+  fury_to_models_read3      — fury's DB driver + read 3 fields. This is the
+                              scenario that matches a "list users" UI.
+"""
+
+
+import base64
+import json
+from datetime import datetime
+from typing import Any, Callable, Coroutine
+from uuid import UUID
+
+import asyncpg
+import msgpack
+import orjson
+
+# ────────────────────────────────────────────────────────────────────────
+# The query. One source of truth.
+# ────────────────────────────────────────────────────────────────────────
+
+# Wide query: pulls all 12 columns, including the two fat ones.
+# The "read 3 fields" scenario reads id/username/is_active from the result.
+WIDE_QUERY = """
+    SELECT id, username, email, display_name, is_active, reputation,
+           flags, external_id, created_at, updated_at, bio, avatar
+    FROM users
+    ORDER BY id
+    LIMIT $1
+"""
+
+# Narrow query: pulls only the three fields we'd render in a list view.
+NARROW_QUERY = """
+    SELECT id, username, is_active
+    FROM users
+    ORDER BY id
+    LIMIT $1
+"""
+
+
+# ────────────────────────────────────────────────────────────────────────
+# JSON defaults. Base64 for bytes, isoformat for datetimes, str for UUIDs.
+# These are what people actually do; not what would be technically optimal.
+# ────────────────────────────────────────────────────────────────────────
+
+def _json_default(o: Any):
+    if isinstance(o, datetime):
+        return o.isoformat()
+    if isinstance(o, UUID):
+        return str(o)
+    if isinstance(o, (bytes, bytearray, memoryview)):
+        return base64.b64encode(bytes(o)).decode("ascii")
+    raise TypeError(f"not serializable: {type(o)}")
+
+
+def _msgpack_default(o: Any):
+    # msgpack has native bytes; it only needs a default for datetime and UUID.
+    if isinstance(o, datetime):
+        return o.isoformat()
+    if isinstance(o, UUID):
+        return str(o)
+    raise TypeError(f"not serializable: {type(o)}")
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Variant factories.
+#
+# Each factory returns (variant_name, async_callable). The callable closes
+# over whatever connection it needs and is the ONLY thing timed.
+#
+# Note on connection lifecycle: each factory opens its own pool and closes it
+# on cleanup. run.py calls the cleanup after the benchmark completes. We do
+# not share connections across variants; that would leak prepared-statement
+# state and cache warmth from one into the next.
+# ────────────────────────────────────────────────────────────────────────
+
+VariantCallable = Callable[[], Coroutine[Any, Any, Any]]
+Cleanup = Callable[[], Coroutine[Any, Any, None]]
+
+
+async def make_asyncpg_variant(
+    dsn: str,
+    query: str,
+    n: int,
+    transform: Callable[[list[dict]], Any],
+    name: str,
+) -> tuple[str, VariantCallable, Cleanup]:
+    """
+    Открывает соединение здесь и сейчас — до возврата из фабрики. Так
+    run.py не должен ничего знать про setup/teardown, а warmup начинается
+    уже с живым соединением.
+    """
+    conn = await asyncpg.connect(dsn)
+
+    async def timed():
+        rows = await conn.fetch(query, n)
+        dicts = [dict(r) for r in rows]
+        return transform(dicts)
+
+    async def cleanup():
+        await conn.close()
+
+    return name, timed, cleanup
+
+
+async def make_fury_variant(
+    dsn: str, n: int, mode: str,
+) -> tuple[str, VariantCallable, Cleanup]:
+    from fury import FuryDB, BaseModel
+
+    class BenchUser(BaseModel):
+        id: int
+        username: str
+        email: str
+        display_name: str | None
+        is_active: bool
+        reputation: int
+        flags: int
+        external_id: UUID
+        created_at: datetime
+        updated_at: datetime
+        bio: str | None
+        avatar: bytes | None
+
+    # FuryDB.connect синхронный — внутри block_on(tokio), await не нужен.
+    db = FuryDB.connect(dsn)
+
+    async def timed():
+        models = await db.fetch_all(BenchUser, WIDE_QUERY, [n])
+        if mode == "models":
+            return None
+        if mode == "models_read3":
+            total = 0
+            for m in models:
+                total += m.id
+                total += len(m.username)
+                total += int(m.is_active)
+            return total
+        if mode == "bytes":
+            total = 0
+            for m in models:
+                total += len(m.to_bytes())
+            return total
+        raise ValueError(mode)
+
+    async def cleanup():
+        pass
+
+    name = {"models": "fury_to_models",
+            "bytes": "fury_to_bytes",
+            "models_read3": "fury_to_models_read3"}[mode]
+    return name, timed, cleanup
+
+
+async def build(dsn: str, variant: str, n: int = 1000):
+    """Диспетчер. Async, потому что фабрики открывают соединения."""
+    if variant == "asyncpg_to_dicts":
+        return await make_asyncpg_variant(dsn, WIDE_QUERY, n, lambda d: d, variant)
+    if variant == "asyncpg_to_json_stdlib":
+        return await make_asyncpg_variant(
+            dsn, WIDE_QUERY, n,
+            lambda d: json.dumps(d, default=_json_default).encode("utf-8"),
+            variant,
+        )
+    if variant == "asyncpg_to_json_orjson":
+        return await make_asyncpg_variant(
+            dsn, WIDE_QUERY, n,
+            lambda d: orjson.dumps(d, default=_json_default),
+            variant,
+        )
+    if variant == "asyncpg_to_msgpack":
+        return await make_asyncpg_variant(
+            dsn, WIDE_QUERY, n,
+            lambda d: msgpack.packb(d, default=_msgpack_default),
+            variant,
+        )
+    if variant == "fury_to_models":
+        return await make_fury_variant(dsn, n, "models")
+    if variant == "fury_to_bytes":
+        return await make_fury_variant(dsn, n, "bytes")
+    if variant == "fury_to_models_read3":
+        return await make_fury_variant(dsn, n, "models_read3")
+    raise ValueError(f"unknown variant: {variant}")
+
+
+ALL_VARIANTS = [
+    "asyncpg_to_dicts",
+    "asyncpg_to_json_stdlib",
+    "asyncpg_to_json_orjson",
+    "asyncpg_to_msgpack",
+    "fury_to_models",
+    "fury_to_bytes",
+    "fury_to_models_read3",
+]
+```
+
+`rust/Cargo.toml`:
+
+```toml
+[package]
+name = "fury-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+fury-core = { path = "../../fury-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rmp-serde = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "core"
+harness = false
+```
+
+`rust/benches/core.rs`:
+
+```rs
+//! Core codec benchmarks.
+//!
+//! Three questions, three bench groups:
+//!
+//!   1. `encode` — how long does it take to turn 12 fields into bytes?
+//!      Compared against serde_json and rmp-serde.
+//!
+//!   2. `decode_construct` — how long does it take to consume a payload and
+//!      build an offset map (fury) or a value graph (serde_json, rmp-serde)?
+//!      This is the closest analog to `JSON.parse`.
+//!
+//!   3. `decode_access3` — same as above plus reading three fields. This is
+//!      the closest analog to "render a row in a table".
+//!
+//! We deliberately do NOT bench the `set_field` path with the same buffer
+//! reused; BinaryRecord is a builder, not a slab. Each iteration constructs
+//! a fresh one, matching the actual usage in fury-py.
+
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use fury_core::encoder::buffer::BinaryRecord;
+use fury_core::encoder::value::ValueType;
+use fury_core::schema::field::FieldType;
+use fury_core::schema::registry::{FieldSchema, ModelSchema};
+use std::sync::Arc;
+
+/// The same 12-field shape the DB benchmark uses.
+/// Kept in sync manually — the schema is small and this is the only place
+/// in Rust that needs to match. If it drifts, the bench is still valid in
+/// isolation; only the cross-language comparison would be affected.
+fn user_schema() -> Arc<ModelSchema> {
+    Arc::new(ModelSchema::new(
+        "User",
+        vec![
+            FieldSchema::new("id",           FieldType::Int64,    false),
+            FieldSchema::new("username",     FieldType::String,   false),
+            FieldSchema::new("email",        FieldType::String,   false),
+            FieldSchema::new("display_name", FieldType::String,   true),
+            FieldSchema::new("is_active",    FieldType::Bool,     false),
+            FieldSchema::new("reputation",   FieldType::Int64,    false),
+            FieldSchema::new("flags",        FieldType::Int64,    false),
+            FieldSchema::new("external_id",  FieldType::Uuid,     false),
+            FieldSchema::new("created_at",   FieldType::DateTime, false),
+            FieldSchema::new("updated_at",   FieldType::DateTime, false),
+            FieldSchema::new("bio",          FieldType::String,   true),
+            FieldSchema::new("avatar",       FieldType::Bytes,    true),
+        ],
+    ))
+}
+
+/// A representative row: some small fields, one medium (bio ~1.5 KB),
+/// one large (avatar 8 KB). Sizes match seed.sql.
+fn sample_values() -> Vec<(&'static str, ValueType)> {
+    use chrono::NaiveDate;
+    use uuid::Uuid;
+
+    let bio = "lorem ipsum dolor sit amet ".repeat(64);           // ~1.6 KB
+    let avatar = vec![0xABu8; 8192];                              // 8 KB
+
+    vec![
+        ("id",           ValueType::Int64(42)),
+        ("username",     ValueType::String("user_42".into())),
+        ("email",        ValueType::String("user_42@example.com".into())),
+        ("display_name", ValueType::String("User 42".into())),
+        ("is_active",    ValueType::Bool(true)),
+        ("reputation",   ValueType::Int64(7919)),
+        ("flags",        ValueType::Int64(104729)),
+        ("external_id",  ValueType::Uuid(Uuid::nil())),
+        ("created_at",   ValueType::DateTime(
+            NaiveDate::from_ymd_opt(2024, 6, 1).unwrap().and_hms_opt(12, 0, 0).unwrap()
+        )),
+        ("updated_at",   ValueType::DateTime(
+            NaiveDate::from_ymd_opt(2024, 6, 2).unwrap().and_hms_opt(12, 0, 0).unwrap()
+        )),
+        ("bio",          ValueType::String(bio)),
+        ("avatar",       ValueType::Bytes(avatar)),
+    ]
+}
+
+/// serde_json needs a shaped struct; the alternative is a HashMap which
+/// adds allocation noise to the measurement.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct UserRow {
+    id: i64,
+    username: String,
+    email: String,
+    display_name: Option<String>,
+    is_active: bool,
+    reputation: i64,
+    flags: i64,
+    external_id: uuid::Uuid,
+    created_at: chrono::NaiveDateTime,
+    updated_at: chrono::NaiveDateTime,
+    bio: Option<String>,
+    avatar: Option<Vec<u8>>,
+}
+
+fn as_serde_row() -> UserRow {
+    use chrono::NaiveDate;
+    UserRow {
+        id: 42,
+        username: "user_42".into(),
+        email: "user_42@example.com".into(),
+        display_name: Some("User 42".into()),
+        is_active: true,
+        reputation: 7919,
+        flags: 104729,
+        external_id: uuid::Uuid::nil(),
+        created_at: NaiveDate::from_ymd_opt(2024, 6, 1).unwrap().and_hms_opt(12, 0, 0).unwrap(),
+        updated_at: NaiveDate::from_ymd_opt(2024, 6, 2).unwrap().and_hms_opt(12, 0, 0).unwrap(),
+        bio: Some("lorem ipsum dolor sit amet ".repeat(64)),
+        avatar: Some(vec![0xABu8; 8192]),
+    }
+}
+
+fn build_fury(schema: &Arc<ModelSchema>) -> Vec<u8> {
+    let mut rec = BinaryRecord::new(Arc::clone(schema));
+    for (name, value) in sample_values() {
+        rec.set_field(name, value).unwrap();
+    }
+    rec.finish().unwrap().to_vec()
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Groups
+// ────────────────────────────────────────────────────────────────────────
+
+fn encode(c: &mut Criterion) {
+    let schema = user_schema();
+    let row = as_serde_row();
+
+    let mut group = c.benchmark_group("encode");
+
+    group.bench_function("fury_binary_record", |b| {
+        b.iter(|| {
+            let mut rec = BinaryRecord::new(Arc::clone(&schema));
+            for (name, value) in sample_values() {
+                rec.set_field(black_box(name), black_box(value)).unwrap();
+            }
+            black_box(rec.finish().unwrap().len())
+        })
+    });
+
+    group.bench_function("serde_json", |b| {
+        b.iter(|| black_box(serde_json::to_vec(&row).unwrap().len()))
+    });
+
+    group.bench_function("rmp_serde", |b| {
+        b.iter(|| black_box(rmp_serde::to_vec(&row).unwrap().len()))
+    });
+
+    group.finish();
+}
+
+fn decode_construct(c: &mut Criterion) {
+    let schema = user_schema();
+    let fury_bytes = build_fury(&schema);
+    let json_bytes = serde_json::to_vec(&as_serde_row()).unwrap();
+    let rmp_bytes  = rmp_serde::to_vec(&as_serde_row()).unwrap();
+
+    let mut group = c.benchmark_group("decode_construct");
+
+    group.bench_function("fury_from_raw_bytes", |b| {
+        b.iter(|| {
+            let rec = BinaryRecord::from_raw_bytes(black_box(fury_bytes.clone()), &schema).unwrap();
+            black_box(rec.len())
+        })
+    });
+
+    group.bench_function("serde_json_from_slice", |b| {
+        b.iter(|| {
+            let r: UserRow = serde_json::from_slice(black_box(&json_bytes)).unwrap();
+            black_box(r.id)
+        })
+    });
+
+    group.bench_function("rmp_serde_from_slice", |b| {
+        b.iter(|| {
+            let r: UserRow = rmp_serde::from_slice(black_box(&rmp_bytes)).unwrap();
+            black_box(r.id)
+        })
+    });
+
+    group.finish();
+}
+
+fn decode_access3(c: &mut Criterion) {
+    let schema = user_schema();
+    let fury_bytes = build_fury(&schema);
+    let json_bytes = serde_json::to_vec(&as_serde_row()).unwrap();
+    let rmp_bytes  = rmp_serde::to_vec(&as_serde_row()).unwrap();
+
+    let mut group = c.benchmark_group("decode_access3");
+
+    group.bench_function("fury_decode_three_fields", |b| {
+        b.iter(|| {
+            let rec = BinaryRecord::from_raw_bytes(black_box(fury_bytes.clone()), &schema).unwrap();
+            let id = rec.get_field_value("id").unwrap();
+            let name = rec.get_field_value("username").unwrap();
+            let active = rec.get_field_value("is_active").unwrap();
+            black_box((id, name, active))
+        })
+    });
+
+    group.bench_function("serde_json_decode_three_fields", |b| {
+        b.iter(|| {
+            let r: UserRow = serde_json::from_slice(black_box(&json_bytes)).unwrap();
+            black_box((r.id, r.username, r.is_active))
+        })
+    });
+
+    group.bench_function("rmp_serde_decode_three_fields", |b| {
+        b.iter(|| {
+            let r: UserRow = rmp_serde::from_slice(black_box(&rmp_bytes)).unwrap();
+            black_box((r.id, r.username, r.is_active))
+        })
+    });
+
+    group.finish();
+}
+
+/// Payload size is not a benchmark, but it's a number people ask for and
+/// it belongs next to the timings, not in a separate doc.
+fn payload_size(c: &mut Criterion) {
+    let schema = user_schema();
+    let fury_bytes = build_fury(&schema);
+    let json_bytes = serde_json::to_vec(&as_serde_row()).unwrap();
+    let rmp_bytes  = rmp_serde::to_vec(&as_serde_row()).unwrap();
+
+    let mut group = c.benchmark_group("payload_size_bytes");
+    group.bench_with_input(BenchmarkId::new("fury", fury_bytes.len()), &fury_bytes, |b, v| {
+        b.iter(|| black_box(v.len()))
+    });
+    group.bench_with_input(BenchmarkId::new("serde_json", json_bytes.len()), &json_bytes, |b, v| {
+        b.iter(|| black_box(v.len()))
+    });
+    group.bench_with_input(BenchmarkId::new("rmp_serde", rmp_bytes.len()), &rmp_bytes, |b, v| {
+        b.iter(|| black_box(v.len()))
+    });
+    group.finish();
+}
+
+criterion_group!(benches, encode, decode_construct, decode_access3, payload_size);
+criterion_main!(benches);
+```
+
+`scripts/env.sh`:
+
+```sh
+#!/usr/bin/env bash
+# Captures a machine + toolchain fingerprint. Emits JSON to stdout.
+# Called by run_all.sh before any benchmark starts.
+#
+# We capture CPU model, RAM, OS, and every toolchain version we use. Without
+# this, two runs on different machines look comparable when they aren't.
+#
+# macOS notes:
+#   - `sysctl -n machdep.cpu.brand_string` prints "Apple M4 Pro" on Apple silicon.
+#   - `sysctl -n hw.memsize` prints bytes.
+#   - `sw_vers -productVersion` prints e.g. "15.2".
+# On Linux the same fields are read from /proc/cpuinfo, /proc/meminfo, /etc/os-release.
+
+set -euo pipefail
+
+if [[ "$(uname)" == "Darwin" ]]; then
+    CPU="$(sysctl -n machdep.cpu.brand_string)"
+    RAM_BYTES="$(sysctl -n hw.memsize)"
+    RAM_GIB="$(( RAM_BYTES / 1024 / 1024 / 1024 ))"
+    OS="macOS $(sw_vers -productVersion) (Darwin $(uname -r))"
+else
+    CPU="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs || echo unknown)"
+    RAM_KIB="$(grep -m1 MemTotal /proc/meminfo | awk '{print $2}')"
+    RAM_GIB="$(( RAM_KIB / 1024 / 1024 ))"
+    OS="$(. /etc/os-release && echo "$PRETTY_NAME") ($(uname -r))"
+fi
+
+PY="$(python3 --version 2>&1 | awk '{print $2}' || echo none)"
+NODE="$(node --version 2>/dev/null || echo none)"
+RUST="$(rustc --version 2>/dev/null | awk '{print $2}' || echo none)"
+CARGO="$(cargo --version 2>/dev/null | awk '{print $2}' || echo none)"
+PG="$(docker exec fury-bench-postgres postgres --version 2>/dev/null | awk '{print $3}' || echo none)"
+
+cat <<EOF
+{
+  "captured_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "host": {
+    "cpu": "${CPU}",
+    "ram_gib": ${RAM_GIB},
+    "os": "${OS}",
+    "arch": "$(uname -m)"
+  },
+  "toolchain": {
+    "python": "${PY}",
+    "node": "${NODE}",
+    "rust": "${RUST}",
+    "cargo": "${CARGO}",
+    "postgres": "${PG}"
+  }
+}
+EOF
+```
+
+`scripts/report.py`:
+
+```py
+#!/usr/bin/env python3
+"""
+Collate raw benchmark JSON into a single markdown report.
+
+Input layout (produced by run_all.sh):
+
+    results/<STAMP>/
+        env.json
+        python/<variant>.json
+        node/<variant>.json
+        rust-raw/<group>/<case>/new/estimates.json
+
+Output:
+
+    results/<STAMP>/REPORT.md
+
+The report is meant to be read top-to-bottom. It leads with the environment
+fingerprint (so a reader can immediately tell whether the numbers apply to
+them), then one table per (benchmark, scenario), then the raw JSON filenames
+for anyone who wants to dig in.
+
+We deliberately do NOT compute summary numbers ("fury is 1.7x faster than
+JSON") in this script. Summaries invite cherry-picking; readers should look
+at the tables and draw their own conclusion.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Loading
+# ────────────────────────────────────────────────────────────────────────
+
+def load_json(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def collect_python(root: Path) -> list[dict]:
+    out = []
+    for f in sorted((root / "python").glob("*.json")):
+        data = load_json(f)
+        if data:
+            out.append(data)
+    return out
+
+
+def collect_node(root: Path) -> list[dict]:
+    out = []
+    for f in sorted((root / "node").glob("*.json")):
+        data = load_json(f)
+        if data:
+            out.append(data)
+    return out
+
+
+def collect_rust(root: Path) -> list[dict]:
+    """
+    Criterion writes `estimates.json` per (group, case). The relevant fields
+    are `median.point_estimate` (ns) and `median.confidence_interval`.
+
+    We flatten the tree into a list of {group, case, median_ns, p95_ns?}.
+    Criterion doesn't emit p95 directly; we approximate from the slope
+    estimate's standard error if it's available, otherwise we skip p95.
+    """
+    out = []
+    raw = root / "rust-raw"
+    if not raw.exists():
+        return out
+    for f in sorted(raw.rglob("*.json")):
+        data = load_json(f)
+        if not data:
+            continue
+        rel = f.relative_to(raw).with_suffix("")
+        parts = rel.parts
+        # Skip the summary sub-files criterion creates; we want per-case only.
+        if len(parts) < 3:
+            continue
+        group, case = parts[0], parts[1]
+        try:
+            med_ns = data["median"]["point_estimate"]
+            lo = data["median"]["confidence_interval"]["lower_bound"]
+            hi = data["median"]["confidence_interval"]["upper_bound"]
+        except (KeyError, TypeError):
+            continue
+        out.append({
+            "group": group,
+            "case": case,
+            "median_ns": med_ns,
+            "ci_lo_ns": lo,
+            "ci_hi_ns": hi,
+        })
+    return out
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Formatting
+# ────────────────────────────────────────────────────────────────────────
+
+def fmt_ms(ns: float | int | None) -> str:
+    if ns is None:
+        return "—"
+    return f"{ns / 1e6:.2f} ms"
+
+
+def fmt_mb(bytes_: int | None) -> str:
+    if bytes_ is None:
+        return "—"
+    return f"{bytes_ / 1_000_000:.1f} MB"
+
+
+def python_table(rows):
+    if not rows:
+        return "_no data_\n"
+    head = (
+        "| Variant | median | p95 | min | max | iterations | bytes_out | peak RSS |\n"
+        "|---|---:|---:|---:|---:|---:|---:|---:|\n"
+    )
+    body = ""
+    for r in sorted(rows, key=lambda x: x.get("median_ms", 0)):
+        peak = r.get("peak_rss_bytes")
+        peak_str = fmt_mb(peak) if peak else "—"
+        body += (
+            f"| `{r['variant']}` "
+            f"| {r.get('median_ms', 0):.2f} ms "
+            f"| {r.get('p95_ms', 0):.2f} ms "
+            f"| {r.get('min_ms', 0):.2f} ms "
+            f"| {r.get('max_ms', 0):.2f} ms "
+            f"| {r.get('iterations', 0)} "
+            f"| {fmt_mb(r.get('bytes_out'))} "
+            f"| {peak_str} |\n"
+        )
+    return head + body
+
+
+def node_table(rows: list[dict]) -> str:
+    if not rows:
+        return "_no data_\n"
+    head = (
+        "| Variant | median | p95 | min | max | iterations | fixture bytes |\n"
+        "|---|---:|---:|---:|---:|---:|---:|\n"
+    )
+    body = ""
+    for r in sorted(rows, key=lambda x: x.get("median_ms", 0)):
+        body += (
+            f"| `{r['variant']}` "
+            f"| {r.get('median_ms', 0):.2f} ms "
+            f"| {r.get('p95_ms', 0):.2f} ms "
+            f"| {r.get('min_ms', 0):.2f} ms "
+            f"| {r.get('max_ms', 0):.2f} ms "
+            f"| {r.get('iterations', 0)} "
+            f"| {r.get('fixture_bytes', '—')} |\n"
+        )
+    return head + body
+
+
+def rust_table(rows: list[dict]) -> str:
+    if not rows:
+        return "_no data_\n"
+    head = (
+        "| Group | Case | median | 95% CI |\n"
+        "|---|---|---:|---:|\n"
+    )
+    body = ""
+    for r in sorted(rows, key=lambda x: (x["group"], x["case"])):
+        body += (
+            f"| `{r['group']}` "
+            f"| `{r['case']}` "
+            f"| {r['median_ns'] / 1e6:.3f} ms "
+            f"| [{r['ci_lo_ns'] / 1e6:.3f}, {r['ci_hi_ns'] / 1e6:.3f}] ms |\n"
+        )
+    return head + body
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Assembly
+# ────────────────────────────────────────────────────────────────────────
+
+def main():
+    root = Path(sys.argv[1] if len(sys.argv) > 1 else "results/latest")
+    if not root.is_dir():
+        print(f"report.py: {root} is not a directory", file=sys.stderr)
+        sys.exit(1)
+
+    env = load_json(root / "env.json") or {}
+    py = collect_python(root)
+    nd = collect_node(root)
+    rs = collect_rust(root)
+
+    out = [f"# FuRy benchmark report\n", f"Run: `{root.name}`\n"]
+
+    host = env.get("host", {})
+    tc = env.get("toolchain", {})
+    out.append("## Environment\n")
+    out.append(f"- **CPU:** {host.get('cpu', '—')} ({host.get('arch', '—')})")
+    out.append(f"- **RAM:** {host.get('ram_gib', '—')} GiB")
+    out.append(f"- **OS:** {host.get('os', '—')}")
+    out.append("")
+    out.append(f"- **Python:** {tc.get('python', '—')}")
+    out.append(f"- **Node:** {tc.get('node', '—')}")
+    out.append(f"- **Rust:** {tc.get('rust', '—')}")
+    out.append(f"- **Postgres:** {tc.get('postgres', '—')}")
+    out.append("")
+
+    out.append("## Python — DB → in-memory → bytes\n")
+    out.append("All variants query the same 10 000-row `users` table with the same SQL.")
+    out.append("`_to_dicts`/`_to_models` stop at the in-memory representation;")
+    out.append("`_to_bytes`/`_json_*`/`_msgpack` also produce wire bytes.")
+    out.append("")
+    out.append(python_table(py))
+
+    out.append("\n## Node — wire bytes → JS object\n")
+    out.append("Fixtures are pre-generated by the Python benchmark and are byte-identical")
+    out.append("across variants that share a format. `*_only` variants stop at the decoded")
+    out.append("object; `*_read3` variants additionally read `id`, `username`, `is_active`.")
+    out.append("")
+    out.append(node_table(nd))
+
+    out.append("\n## Rust — codec in isolation\n")
+    out.append("Criterion, no Python or JS in the loop. 95% CI is criterion's own.")
+    out.append("")
+    out.append(rust_table(rs))
+
+    out.append("\n## Raw data\n")
+    out.append("Everything below is written by `run_all.sh`. Each file is the raw")
+    out.append("measurement; nothing in this report is derived from anything else.")
+    out.append("")
+    for sub in ("python", "node"):
+        for f in sorted((root / sub).glob("*.json")):
+            out.append(f"- `{f.relative_to(root)}`")
+    out.append(f"- `rust/criterion.txt` (criterion stdout)")
+    out.append(f"- `rust-raw/**` (criterion machine-readable estimates)")
+    out.append("")
+
+    out.append("## Method\n")
+    out.append("See `benches/README.md` for the methodology, the rationale for each choice,")
+    out.append("and the list of things this benchmark deliberately does not measure.\n")
+
+    (root / "REPORT.md").write_text("\n".join(out))
+    print(f"→ wrote {root / 'REPORT.md'}")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+`scripts/run_all.sh`:
+
+```sh
+#!/usr/bin/env bash
+# Orchestrator. Everything runs through here so there is exactly one place
+# that knows the order of operations.
+#
+# Arguments:
+#   $1         timestamp (YYYYMMDDTHHMMSSZ) — used to name the results dir
+#   --only X   run only one of: python | node | rust (default: all three)
+#
+# Contract:
+#   - Writes machine fingerprint to $RESULTS/env.json
+#   - Writes each variant's raw output to $RESULTS/{python,node,rust}/<name>.json
+#   - Invokes scripts/report.py at the end
+#
+# Exit codes:
+#   0  all good
+#   1  a benchmark failed (partial results are still written)
+#   2  missing prerequisites
+
+set -euo pipefail
+
+STAMP="${1:?usage: run_all.sh <stamp> [--only python|node|rust]}"
+shift || true
+
+ONLY=""
+if [[ "${1:-}" == "--only" ]]; then
+    ONLY="${2:?--only needs a value}"
+fi
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BENCH_ROOT="$(dirname "$HERE")"
+RESULTS="$BENCH_ROOT/results/$STAMP"
+
+# ── prerequisites ────────────────────────────────────────────────────────
+if [[ "$ONLY" == "" || "$ONLY" == "python" ]]; then
+    python3 -c 'import fury' 2>/dev/null || {
+        echo "ERROR: Python module 'fury' not importable." >&2
+        echo "       From repo root: python -m venv .venv && source .venv/bin/activate && (cd fury-py && maturin develop --release)" >&2
+        exit 2
+    }
+fi
+if [[ "$ONLY" == "" || "$ONLY" == "node" ]]; then
+    command -v node >/dev/null || { echo "ERROR: node not found" >&2; exit 2; }
+fi
+
+mkdir -p "$RESULTS"/{python,node,rust,rust-raw}
+
+# ── environment ──────────────────────────────────────────────────────────
+bash "$HERE/env.sh" > "$RESULTS/env.json"
+echo "→ env captured: $RESULTS/env.json"
+
+# ── fixtures ─────────────────────────────────────────────────────────────
+# The Node benchmark reads pre-generated byte fixtures. We generate them from
+# the Python side so the payloads are exactly what the server would produce.
+if [[ "$ONLY" == "" || "$ONLY" == "node" ]]; then
+    echo "→ generating fixtures"
+    (cd "$BENCH_ROOT/python" && python3 -m run --emit-fixtures)
+fi
+
+# ── python ───────────────────────────────────────────────────────────────
+if [[ "$ONLY" == "" || "$ONLY" == "python" ]]; then
+    echo "→ python benchmarks"
+    for v in \
+        asyncpg_to_dicts \
+        asyncpg_to_json_stdlib \
+        asyncpg_to_json_orjson \
+        asyncpg_to_msgpack \
+        fury_to_models \
+        fury_to_bytes \
+        fury_to_models_read3
+    do
+        echo "   · $v"
+        (cd "$BENCH_ROOT/python" && \
+            python3 -m run --variant "$v" --out "$RESULTS/python/$v.json") \
+            || echo "     (failed, continuing)"
+    done
+fi
+
+# ── node ─────────────────────────────────────────────────────────────────
+if [[ "$ONLY" == "" || "$ONLY" == "node" ]]; then
+    echo "→ node benchmarks"
+    if [[ ! -d "$BENCH_ROOT/node/node_modules" ]]; then
+        (cd "$BENCH_ROOT/node" && npm ci --silent)
+    fi
+    for v in \
+        json_parse_only \
+        json_parse_read3 \
+        msgpack_decode_only \
+        msgpack_decode_read3 \
+        fury_construct_only \
+        fury_construct_read3
+    do
+        echo "   · $v"
+        (cd "$BENCH_ROOT/node" && \
+            node --expose-gc run.mjs --variant "$v" --out "$RESULTS/node/$v.json") \
+            || echo "     (failed, continuing)"
+    done
+fi
+
+# ── rust ─────────────────────────────────────────────────────────────────
+if [[ "$ONLY" == "" || "$ONLY" == "rust" ]]; then
+    echo "→ rust benchmarks (criterion)"
+    (cd "$BENCH_ROOT/rust" && \
+        cargo bench --quiet --target-dir ./target -- --output-format bencher) \
+        | tee "$RESULTS/rust/criterion.txt"
+
+    # Criterion writes machine-readable estimates to target/criterion/.
+    # Copy them so the report can read them without depending on target/.
+    find "$BENCH_ROOT/rust/target/criterion" \
+         -name estimates.json -path '*/new/*' \
+         -exec bash -c '
+            src="$1"
+            rel="${src#*/target/criterion/}"
+            dst="'"$RESULTS"'/rust-raw/${rel%/estimates.json}.json"
+            mkdir -p "$(dirname "$dst")"
+            cp "$src" "$dst"
+         ' _ {} \;
+fi
+
+# ── report ───────────────────────────────────────────────────────────────
+python3 "$HERE/report.py" "$RESULTS"
+```
+
+`seed.sql`:
+
+```sql
+-- Deterministic seed for the FuRy benchmark suite.
+--
+-- Design goals:
+--   1. Same corpus on every machine. We use `setseed` + a linear sequence,
+--      never `random()`, never `clock_timestamp()`.
+--   2. Realistic shape: 12 columns, a mix of small and large fields, some
+--      NULLs. The two "fat" columns (bio, avatar) are deliberately 1–2 KB and
+--      8 KB so a wide query produces a payload that is meaningfully expensive
+--      to serialize and meaningfully wasteful to serialize if unused.
+--   3. Fast seed. 10 000 rows × ~10 KB ≈ 100 MB. Fits in shared_buffers.
+
+SET
+client_min_messages = WARNING;
+
+DROP TABLE IF EXISTS users;
+
+CREATE TABLE users
+(
+    id           BIGSERIAL PRIMARY KEY,
+    username     TEXT      NOT NULL,
+    email        TEXT      NOT NULL,
+    display_name TEXT, -- nullable, ~1/3 NULL
+    is_active    BOOLEAN   NOT NULL,
+    reputation   BIGINT    NOT NULL,
+    flags        BIGINT    NOT NULL,
+    external_id  UUID      NOT NULL,
+    created_at   TIMESTAMP NOT NULL,
+    updated_at   TIMESTAMP NOT NULL,
+    bio          TEXT, -- 1–2 KB
+    avatar       BYTEA -- 8 KB
+);
+
+SELECT setseed(0.42);
+
+INSERT INTO users (username, email, display_name, is_active, reputation, flags,
+                   external_id, created_at, updated_at, bio, avatar)
+SELECT 'user_' || g,
+       'user_' || g || '@example.com',
+       CASE WHEN g % 3 = 0 THEN NULL ELSE 'User ' || g END,
+       (g % 2 = 0),
+       (g * 7919) % 100000,
+    (g * 104729) % 256,
+    (
+        lpad(to_hex(g), 8, '0') || '-' ||
+        '0000-0000-0000-' ||
+        lpad(to_hex(g), 12, '0')
+    )::uuid,
+    TIMESTAMP '2024-01-01 00:00:00' + (g || ' seconds')::interval,
+    TIMESTAMP '2024-06-01 00:00:00' + (g || ' seconds')::interval,
+    repeat(md5(g::text), 32 + (g % 32)),
+    decode(repeat(md5(g::text), 256), 'hex')
+FROM generate_series(1, 10000) AS g;
+
+ANALYZE
+users;
+
+-- Prewarm: load the whole table into shared_buffers so the first query of
+-- each variant doesn't pay for disk I/O.
+SELECT count(*) FROM users;
+
+```

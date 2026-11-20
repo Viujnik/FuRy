@@ -8,8 +8,11 @@ name = "fury"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { workspace = true, features = ["extension-module"] }
+pyo3.workspace = true
 pyo3-async-runtimes.workspace = true
 fury-core = { path = "../fury-core" }
 chrono = "0.4.45"
 uuid = "1.23.4"
+
+[features]
+extension-module = ["pyo3/extension-module"]

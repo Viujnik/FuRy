@@ -18,6 +18,7 @@ pub enum LangTo {
 #[command(
     name = "fury",
     about = "Fury Serialization Ecosystem CLI",
+    version,
     propagate_version = true
 )]
 pub struct FuryCli {

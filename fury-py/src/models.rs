@@ -81,14 +81,14 @@ impl BaseModel {
 
         let mut ordered: Vec<(String, Bound<'py, PyAny>)> = Vec::new();
         for base_class in mro.iter().rev() {
-            if let Ok(annotations_obj) = base_class.getattr("__annotations__") {
-                if let Ok(dict) = annotations_obj.cast::<PyDict>() {
-                    for (key, value) in dict.iter() {
-                        let k: String = key.extract()?;
-                        match ordered.iter_mut().find(|(name, _)| *name == k) {
-                            Some(slot) => slot.1 = value,
-                            None => ordered.push((k, value)),
-                        }
+            if let Ok(annotations_obj) = base_class.getattr("__annotations__")
+                && let Ok(dict) = annotations_obj.cast::<PyDict>()
+            {
+                for (key, value) in dict.iter() {
+                    let k: String = key.extract()?;
+                    match ordered.iter_mut().find(|(name, _)| *name == k) {
+                        Some(slot) => slot.1 = value,
+                        None => ordered.push((k, value)),
                     }
                 }
             }
@@ -100,9 +100,12 @@ impl BaseModel {
         }
 
         let schema = ModelSchema::new(name.clone(), fields);
-        get_global_registry().register(schema);
+        let emit = std::env::var_os("FURY_EMIT_MODELS").is_some();
+        get_global_registry()
+            .register_with_cache(schema, emit)
+            .map_err(fury_error_to_pyerr)?;
 
-        if std::env::var("FURY_EMIT_MODELS").is_ok() {
+        if emit {
             println!("__FURY_MODEL__:{name}");
         }
 
@@ -313,10 +316,12 @@ fn parse_python_type(type_obj: &Bound<'_, PyAny>) -> PyResult<(FieldType, bool)>
             "Union" | "UnionType" => {
                 let mut inner: Option<Bound<'_, PyAny>> = None;
                 for arg in args.iter() {
-                    if arg.is_none() {
+                    if arg.is(py.get_type::<pyo3::types::PyNone>()) {
                         nullable = true;
-                    } else if inner.is_none() {
-                        inner = Some(arg);
+                    } else if inner.replace(arg).is_some() {
+                        return Err(pyo3::exceptions::PyTypeError::new_err(
+                            "only unions of one supported type with None are supported",
+                        ));
                     }
                 }
                 if let Some(t) = inner {

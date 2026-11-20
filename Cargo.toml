@@ -3,12 +3,13 @@ resolver = "2"
 members = [
     "fury-core",
     "fury-py",
-    "fury-cli"
-    , "fury-ts"]
+    "fury-cli",
+    "fury-ts",
+    "benches/rust",
+]
 default-members = ["fury-core", "fury-cli"]
 [workspace.dependencies]
-sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "any", "chrono", "uuid", "macros"] }
 tokio = { version = "1.36", features = ["full"] }
 thiserror = "2.0.18"
-pyo3 = { version = "0.29.0", features = ["extension-module", "experimental-async"] }
+pyo3 = { version = "0.29.0", features = ["experimental-async"] }
 pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }
