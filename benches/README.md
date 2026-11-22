@@ -16,7 +16,7 @@ Each JSON sample records the corpus hash, format payload size, runtime WASM hash
 
 ## Run the frontend checks
 
-Build the Python and Node-target WASM packages with `bash scripts/check-bindings.sh`. Run from the repository root.
+Build the Python and Node-target WASM packages with `FURY_WASM_PROFILE=release bash scripts/check-bindings.sh`. Run from the repository root.
 
 ```sh
 npm ci --prefix benches/node --ignore-scripts --no-audit --no-fund
@@ -24,7 +24,9 @@ node --test benches/node/benchmark.test.mjs
 export FURY_BENCH_PYTHON="$PWD/target/bindings/current/venv/bin/python"
 export FURY_BENCH_WASM="$PWD/target/bindings/current/wasm/fury_ts.js"
 node --expose-gc benches/node/check.mjs --smoke
-node --expose-gc benches/node/check.mjs --out /path/to/empty/candidate-results
+results=$(mktemp -d)
+node --expose-gc benches/node/check.mjs --out "$results"
+echo "$results"
 ```
 
 Set `FURY_WASM_PROFILE=release` before building for latency measurements. Use one runner, matching Rust, Node and WASM build flags, and an otherwise idle machine for both versions.

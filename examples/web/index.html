@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FuRy inventory</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: light dark; font-family: Inter, system-ui, sans-serif; }
+  body { margin: 0 auto; max-width: 45rem; padding: 3rem 1rem; }
+  h1 { margin: 0; }
+  p { margin: .75rem 0 1.5rem; }
+  .table { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { padding: .7rem; text-align: left; border-bottom: 1px solid GrayText; }
+  td:first-child { font-variant-numeric: tabular-nums; }
+</style>
+<main>
+  <h1>FuRy inventory</h1>
+  <p id="status" role="status">Loading records…</p>
+  <div class="table">
+    <table>
+      <thead><tr><th scope="col">ID</th><th scope="col">Item</th><th scope="col">Availability</th><th scope="col">Note</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</main>
+<script type="importmap">
+  {"imports":{"@fury/wasm-core":"/wasm/fury_ts.js"}}
+</script>
+<script type="module" src="/app.js"></script>

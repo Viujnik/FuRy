@@ -74,6 +74,8 @@ jobs:
           cargo install --locked --version 0.15.0 wasm-pack
       - run: cargo test --locked -p fury-core --test postgres_contract -- --ignored
       - run: bash scripts/check-bindings.sh --postgres
+      - name: Smoke-test the PostgreSQL-to-web example
+        run: bash scripts/check-web-demo.sh
       - run: bash scripts/check-benchmarks.sh
       - name: Keep benchmark measurements
         if: ${{ always() }}

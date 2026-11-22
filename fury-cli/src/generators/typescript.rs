@@ -1,13 +1,13 @@
 use fury_core::schema::registry::{FieldType, ModelSchema};
 use std::fmt::Write;
-use std::fs;
-use std::path::Path;
 use std::sync::Arc;
 
 use crate::errors::CliError;
 
-/// Iterates over validated schemas and writes the corresponding TypeScript classes to disk.
-pub fn generate_all(schemas: &[Arc<ModelSchema>], dst_dir: &Path) -> Result<(), CliError> {
+/// Check all model names and render the corresponding TypeScript classes.
+pub(super) fn generate_all(
+    schemas: &[Arc<ModelSchema>],
+) -> Result<Vec<(String, String)>, CliError> {
     let mut filenames = std::collections::HashSet::new();
     let mut generated = Vec::with_capacity(schemas.len());
     for schema in schemas {
@@ -39,15 +39,7 @@ pub fn generate_all(schemas: &[Arc<ModelSchema>], dst_dir: &Path) -> Result<(), 
         generated.push((filename, generate_class_string(schema)));
     }
 
-    fs::create_dir_all(dst_dir).map_err(|source| CliError::Io {
-        path: dst_dir.to_path_buf(),
-        source,
-    })?;
-    for (filename, code) in generated {
-        let path = dst_dir.join(filename);
-        fs::write(&path, code).map_err(|source| CliError::Io { path, source })?;
-    }
-    Ok(())
+    Ok(generated)
 }
 
 /// Check whether a name can be emitted as a safe TypeScript identifier.

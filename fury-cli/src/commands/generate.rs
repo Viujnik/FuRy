@@ -3,7 +3,12 @@ use crate::errors::CliError;
 use crate::extractors;
 use crate::generators;
 use fury_core::schema::registry::SchemaRegistry;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Handles the end-to-end flow of schema extraction and code generation.
 pub fn handle_generate(
@@ -49,9 +54,12 @@ pub fn handle_generate(
 
     let registry = SchemaRegistry::encode_schemas(schemas_to_generate.iter().map(AsRef::as_ref))
         .map_err(|e| CliError::ParseError(e.to_string()))?;
+    let generated = generators::generate_all(&schemas_to_generate, lang_to)?;
     let dst_path = PathBuf::from(dst);
-    generators::generate_all(&schemas_to_generate, &dst_path, lang_to)?;
-
+    fs::create_dir_all(&dst_path).map_err(|source| CliError::Io {
+        path: dst_path.clone(),
+        source,
+    })?;
     let canonical_dst = dst_path.canonicalize().map_err(|source| CliError::Io {
         path: dst_path.clone(),
         source,
@@ -62,11 +70,51 @@ pub fn handle_generate(
             path: ".".into(),
             source,
         })?;
+    let mut files: Vec<_> = generated
+        .into_iter()
+        .map(|(name, code)| (canonical_dst.join(name), code.into_bytes()))
+        .collect();
     // When generating in-place the cache is also the input registry.
-    if canonical_dst == cwd {
-        return Ok(());
+    if canonical_dst != cwd {
+        files.push((canonical_dst.join(".fury_registry.bin"), registry));
     }
-    let path = dst_path.join(".fury_registry.bin");
-    std::fs::write(&path, registry).map_err(|source| CliError::Io { path, source })?;
+    for (path, _) in &files {
+        check_output_path(path).map_err(|source| CliError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    }
+    for (path, bytes) in files {
+        write_output_file(&path, &bytes).map_err(|source| CliError::Io { path, source })?;
+    }
     Ok(())
+}
+
+fn check_output_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(()),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "generated output path is not a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Replace a generated file only after its complete contents have been written.
+fn write_output_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+    let temp = path.with_file_name(format!(".fury-generated-{}-{id}.tmp", std::process::id()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let result = written.and_then(|()| fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }

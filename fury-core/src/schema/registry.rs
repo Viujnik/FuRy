@@ -96,7 +96,7 @@ impl SchemaRegistry {
     pub fn encode_schemas<'a>(
         schemas: impl IntoIterator<Item = &'a ModelSchema>,
     ) -> Result<Vec<u8>> {
-        let mut schemas: Vec<_> = schemas.into_iter().collect();
+        let mut schemas: Vec<_> = schemas.into_iter().take(MAX_MODELS + 1).collect();
         if schemas.len() > MAX_MODELS {
             return Err(invalid("too many schemas"));
         }
@@ -140,6 +140,12 @@ impl SchemaRegistry {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self> {
         use std::io::Read;
+        let path = path.as_ref();
+        let metadata =
+            std::fs::metadata(path).map_err(|e| invalid(format!("read registry: {e}")))?;
+        if !metadata.is_file() {
+            return Err(invalid("registry cache must be a regular file"));
+        }
         let file = std::fs::File::open(path).map_err(|e| invalid(format!("read registry: {e}")))?;
         let mut bytes = Vec::new();
         file.take((MAX_REGISTRY_BYTES + 1) as u64)

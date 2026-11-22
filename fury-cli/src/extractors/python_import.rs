@@ -4,11 +4,16 @@ use std::process::Command;
 
 /// Executes the selected trusted Python file to collect its registered model names.
 pub fn import_python_module(src_path: &Path) -> Result<Vec<String>, CliError> {
-    let python = resolve_python()?;
     let source = src_path.canonicalize().map_err(|source| CliError::Io {
         path: src_path.to_path_buf(),
         source,
     })?;
+    if !source.is_file() {
+        return Err(CliError::ParseError(
+            "Python schema source must be a regular file".into(),
+        ));
+    }
+    let python = resolve_python()?;
     // Source paths are arguments. The requested source takes precedence over
     // identically named files in the caller's working directory.
     let script = r#"

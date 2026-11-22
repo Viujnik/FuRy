@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "ESNext.Disposable"],
+    "rootDir": ".",
+    "outDir": "site",
+    "paths": {
+      "@fury/wasm-core": ["./wasm/fury_ts.d.ts"]
+    }
+  },
+  "include": ["app.ts", "records.ts", "models/item.ts"]
+}

@@ -1,483 +1,52 @@
-# FuRy-core workspace
+# fury-core
 
-## За что отвечает
+The Rust crate provides schema definitions, the wire-v2 codec, and an optional PostgreSQL adapter. Disable default features when you only need schemas and records.
 
-`fury-core` - это единственный крейт в workspace, который
-понимает, как устроены данные в FuRy. Всё остальное (fury-py, fury-ts, fury-cli)
-
-- это тонкие обёртки, которые ходят в него за функциями. Конкретно ядро знает
-  три вещи:
-
-1. Как устроены схемы моделей - какие у модели поля, каких они типов, nullable
-   они или нет - и где эти схемы хранятся, чтобы несколько процессов (сервер,
-   CLI, браузер) видели одну и ту же картину мира (модуль `schema`);
-2. Как сериализовать одно значение и целую запись в собственный бинарный
-   формат и распарсить их обратно, с проверками целостности (модуль `encoder`);
-3. Как сходить в PostgreSQL через sqlx и превратить строки результата в эти
-   бинарные записи (модуль `db`).
-
-> \* Модуль `db` подключён cargo-фичей `db` (включена по умолчанию). fury-ts
-> собирается с `default-features = false`: sqlx тянет tokio, который не
-> компилируется под wasm32, а браузеру база и не нужна - там нужны только схемы и кодек.
-
----
-
-## Errors. FuryError - src/error.rs
-
-Представляет собой один enum `FuryError`, в который
-собираются все ошибки ядра: от «не смог подключиться к базе» до
-«в буфере кривой флаг». Рядом лежит алиас `Result<T>`, чтобы все функции ядра
-возвращали `Result<T, FuryError>`, не расписывая тип ошибки в каждой сигнатуре.
-
-На enum навешаны три derive, и каждый из них здесь не для красоты:
-
-- `#[derive(Error)]` - это derive из крейта thiserror. Он читает атрибуты
-  `#[error("...")]` и генерирует за нас `impl Display` и
-  `impl std::error::Error`. Благодаря этому `FuryError` можно напечатать через
-  `println!("{error}")`, отдать в любую функцию, ожидающую `dyn Error`, и
-  ведёт себя как std-ошибка;
-- `#[derive(Debug)]` - для `{:?}`: это `unwrap`/`expect`, panic-сообщения,
-  логи и консоль разработчика;
-- `#[derive(Clone)]` - ошибки в FuRy путешествуют через границы потоков и
-  задач: executor крутится в tokio, результат забирает PyO3 через
-  `future_into_py`, WASM-сторона живёт в своём потоке. Clone-ошибку
-  можно перекладывать между задачами, не переживая за владение. Клонирование
-  при этом почти бесплатное, потому что строковые payload'ы лежат в
-  `Arc<str>`/`Box<str>`.
-
-> \* **Про использование `Arc<str>` и `Box<str>` в ошибках:**
->
-> В перечислении `FuryError` используются типы `Arc<str>` и `Box<str>` вместо классического `String`. Оба типа
-> гарантируют, что текст ошибки является неизменяемым и занимает ровно столько памяти, сколько нужно.
->
-> Но почему используются 2 типа одновременно? Выбор между ними зависит от **природы ошибки**:
->
-> * **`Arc<str>`:**
-    > Используется для ошибок, которые могут передаваться из одного потока в другой.
-> * **`Box<str>`:**
-    > Используется для уникальных сообщений, которые создаются «на лету» и больше нигде в системе не дублируются.
-
-Также мы имеем `impl From<sqlx::Error> for FuryError`, обёрнутый в
-`#[cfg(feature = "db")]`. Он нужен, чтобы в `db/executor.rs` можно было писать
-`.await?` на вызовах sqlx и ошибка базы сама превращалась в
-`FuryError::Database`. А `cfg` стоит потому, что при сборке ядра без фичи
-`db` (как делает fury-ts) sqlx вообще отсутствует в зависимостях - и этот impl
-не смог бы скомпилироваться.
-
-### Кто и как использует эти ошибки
-
-Есть три варианта использования этих ошибок:
-
-- **fury-py** мапит ветки на разные питоновские исключения в функции
-  `fury_error_to_pyerr` (файл `fury-py/src/errors.rs`). Маппинг следующий:
-  `Database`, `Encoding`, `BufferNotFinished`,
-  `BufferAlreadyFinished` становятся `RuntimeError`;
-  `SchemaNotFound`, `FieldNotFound`,
-  `QueryResultRowMismatch`, `InvalidSchema` становятся `ValueError` (проблема
-  в данных или в модели); `TypeMismatch` становится `TypeError` (схема и база
-  договорились о разных типах).
-- **fury-ts** по веткам не мапит вообще: на WASM-границе всё превращается в
-  `JsValue::from_str(...)` с текстом ошибки, потому что wasm-bindgen не умеет
-  пробрасывать в JS rust-овые классы исключений - там остаётся только строка,
-  и этого достаточно;
-- **fury-cli** не использует `FuryError` вовсе. У CLI свой enum `CliError`:
-  его ошибки - это другой класс проблем («не смог прочитать файл», «не нашёл
-  ни одной модели в исходнике», «модель есть в исходнике, но её нет в
-  реестре»), они печатаются человеку в терминал, и тащить сюда ошибки ядра смысла мало.
-
-### Какие ошибки бывают
-
-- `Database(Arc<str>)` - любая ошибка sqlx: коннект, упавший запрос, таймаут.
-  Текст приходит из драйвера как есть;
-- `QueryResultRowMismatch { expected, actual }` - строгое ограничение на
-  число строк нарушено: `fetch_one` ждёт ровно одну строку, а база вернула
-  ноль или несколько;
-- `Encoding(Box<str>)` - не удалось (де)сериализовать: repack кривого поля,
-  «коллекцию нельзя достать из строки БД», имя поля длиннее 255 байт и т.п.;
-- `SchemaNotFound(Arc<str>)` - схемы с таким именем нет в реестре: забыли
-  зарегистрировать, не вызвали `loadRegistry` в браузере, или процесс стартовал
-  до того, как файл появился;
-- `FieldNotFound { field, schema }` - `set_field` позвали с именем, которого в
-  схеме нет (опечатка в коде модели);
-- `TypeMismatch { field, expected, actual }` - тип колонки в базе не совпал с
-  типом, который ожидает схема (см. раздел про строгость Postgres в
-  executor.rs);
-- `BufferNotFinished` - попытка прочитать байты записи до `finish()`;
-- `BufferAlreadyFinished` - попытка дописать поле в уже финализированную
-  запись (без предварительного `reopen()`);
-- `InvalidSchema(Box<str>)` - побитый, чужой или устаревший буфер при парсинге:
-  не сошёлся размер, кривой magic/версия, обрезанный payload.
-
----
-
-## Schema-модуль
-
-Модуль `schema` - он не знает ни про кодек, ни про базу данных.
-Здесь живут описание типов полей, описание моделей и общий реестр схем с
-сохранением в файл.
-
-### Field
-
-Центральный объект - enum `FieldType`: содержит все поддерживаемые типы (числа со
-знаком и без, float'ы, bool, строки, байты), темпоральные `DateTime`/`Date`,
-`Uuid` и рекурсивные коллекции `List(Box<FieldType>)`,
-`Map(Box<FieldType>, Box<FieldType>)` и `Object(String)` (строка внутри Object
-
-- имя схемы вложенного объекта, пока носит справочный характер).
-
-Derives здесь такие:
-
-- `Serialize, Deserialize` - `FieldType` входит в состав `ModelSchema`, а
-  схемы сериализуются в `.fury_registry.bin` (bincode) и десериализуются каждым
-  потребителем: сервером, CLI и браузером через `loadRegistry`. Без этих
-  derive реестр просто не мог бы сохраняться на диск;
-- `Clone` - схемы клонируются при регистрации и при выдаче из реестра; сам
-  `FieldType` дополнительно копируется в кодек при каждом вызове;
-- `PartialEq, Eq` - сравнение схем (`ModelSchema::eq`) и тесты;
-- `Hash` - позволяет использовать `FieldType` ключом в `HashMap`; **внутри ядра
-  пока не используется**;
-- `Debug` - логи и `format!("{:?}", field_type)` в сообщениях об ошибках.
-
-Функции:
-
-- `fixed_size(&self) -> Option<usize>` - возвращает размер payload в байтах для фиксированных типов (Например, `Some(4)`
-  для Int32, `None` для String). Главный потребитель - `buffer.rs::new()`, которая по этим размерам преаллоцирует буфер:
-  для fixed-типов `1 + size` (флаг + payload), для переменных - эвристика `1 + 8`.
-- `is_collection(&self) -> bool` - `true` для `List | Map | Object`. **Внутри ядра не вызывается**.
-- `is_variable_length(&self) -> bool` - `true` для коллекций плюс `String` и `Bytes`. **Тоже задел на будущее**.
-- `as_str(&self) -> &'static str` - имя типа без аллокаций (`"Int64"`, `"List"`); используется в `impl Display` и удобен
-  в логах.
-- `field_depth(&self) -> usize` - максимальная глубина вложенности коллекций: для `List<Int64>` вернёт 1, для
-  `List<List<Int64>>` - 2, для скаляра - 0. **Сейчас не вызывается; задумывалась для валидации схем против `MAX_DEPTH`
-  из value.rs ещё на этапе регистрации (На будущее: можно воткнуть эту проверку в `register()`)**.
-- `impl Display for FieldType` - печатает тип в человекочитаемом виде: примитивы через `as_str()`, а коллекции
-  рекурсивно разворачиваются в `List<Int64>` / `Map<String, Int32>` без единой аллокации. Удобно в логах и ошибках.
-
-### Registry
-
-Описывает три типа и одну глобальную точку входа:
-
-* `FieldSchema` - описание одного поля: имя, тип, nullable, плюс геттеры
-  (`name()`, `field_type()`, `is_nullable()`). Derives - `Clone, Debug,
-PartialEq, Serialize, Deserialize`: `PartialEq` нужен для сравнения схем,
-  `Serialize/Deserialize` - для файла реестра.
-* `ModelSchema` - модель: имя, `fields: Vec<FieldSchema>` и
-  `field_index: HashMap<String, usize>` (имя → позиция). Derives -
-  `Clone, Debug, Serialize, Deserialize`; а вот `PartialEq` реализован вручную:
-  схемы считаются равными, если совпадают имя и **порядок** полей. Порядок важен
-  исторически (в v1 буфер парсился строго по порядку схемы), да и сейчас он
-  определяет порядок байтов при записи/репаке и человекочитаемые диффы, поэтому
-  равенство оставили строгим. Поле `field_index` помечено `#[serde(skip)]`: это
-  производные данные, они перестраиваются методом `build_field_index` при
-  загрузке файла; тащить HashMap в файл бессмысленно (bincode сериализовать-то
-  сможет, но это лишний вес).
-* `SchemaRegistry` - потокобезопасное хранилище всех зарегистрированных моделей:
-  `Arc<RwLock<HashMap<String, Arc<ModelSchema>>>>`. Derives -
-  `Clone, Default`. `Clone` здесь дешёвый: клон реестра - это клон `Arc`, обе
-  копии смотрят в один и тот же map; именно поэтому `FuryDB::connect` в fury-py
-  спокойно клонирует реестр в `db/executor.rs`. `Default` - старт пустым (тесты, WASM).
-  `parking_lot::RwLock` выбран вместо `std::sync::RwLock` по двум причинам: он не
-  подвержен poisoning (паник писателя не «заражает» лок навсегда) и быстрее на
-  коротких критических секциях, а у нас секции именно короткие.
-
-Методы:
-
-* `new()` - получение из `.fury_registry.bin` в текущей рабочей директории:
-  файл читается, bincode-deserialize в `Vec<ModelSchema>`, для каждой схемы
-  перестраивается индекс. **Любой сбой (файла нет(что может быть и нормальной ситуацией), битый bincode, нет
-  файловой системы - как под wasm32) приводит к тому, что реестр **молча**
-  стартует пустым**. (На будущее: можно логировать причину);
-* `register(schema)` - вставить или заменить схему по имени и перезаписать
-  файл **целиком**: сериализуется весь map, пишется в
-  `.fury_registry.bin.tmp`, затем с помощью атомарного `rename` в `.fury_registry.bin`. Атомарность здесь -
-  свойство `rename` на POSIX: читатель видит либо старый файл, либо новый,
-  никогда «половину». Обратная сторона: каждая регистрация - O(n)
-  сериализация всего реестра;
-* `get` - получение схемы по названию;
-* `get_all_schemas` - получение всех схем из реестра(Например, используется CLI при `--src all`);
-* `contains/remove/len/is_empty/list_models`- **пока не используются**.
-
-`get_global_registry()` - `OnceLock::get_or_init(SchemaRegistry::new)`.
-`OnceLock` означает: реестр инициализируется один раз на процесс, в момент
-первого вызова, и снимает слепок файла именно в этот момент. **Отсюда два
-операционных подвоха**: в fury-cli критичен порядок -
-сначала subprocess-импорт моделей обновляет файл, и только потом первый вызов
-`get_global_registry()`; (2) долгоживущий сервер не увидит изменённые модели без перезапуска процесса.
-
----
-
-## Encoder-модуль
-
-Модуль `encoder` - это сам бинарный формат. Два файла: `value.rs` описывает,
-как кодируется одно значение, `buffer.rs` - как из значений собирается запись
-и как она живёт.
-
-### Value
-
-`ValueType` - любое значение, которое умеет хранить FuRy: None, все числа,
-float'ы, bool, строки, байты, даты, uuid и вложенные коллекции. Derives -
-`Clone, Debug, PartialEq`: `Clone` нужен `rebuild_buffer` (значения
-вычитываются из старого буфера и записываются в новый), `PartialEq` - тестам
-(roundtrip «записал → прочитал → сравнил»), `Debug` - логам.
-
-Константы файла:
-
-- `FLAG_NONE = 0x00` и `FLAG_SOME = 0x01` - флаги, с которых начинается
-  каждое значение: null или «значение присутствует»;
-- `MAX_DEPTH = 16` - ограничение рекурсии для List/Map: защита от
-  злонамеренного или непродуманного `List<List<List<...>>>`, который иначе
-  переполнил бы стек;
-- `UNIX_EPOCH` - эпоха как compile-time константа: `match` с
-  `from_ymd_opt(1970,1,1)` вычисляется компилятором, чтобы не делать
-  `unwrap` на каждый encode даты в рантайме.
-
-Файл имеет макрос `write_primitive!` - записывает в буфер «флаг + LE-байты» одной строкой, чтобы не
-повторять код на каждый числовой тип.
-
-**Байтовая раскладка значения** - определяется и пишется именно здесь
-(`write_to`):
-
-| Тип                                     | Payload                                       | Итого байт |
-|-----------------------------------------|-----------------------------------------------|------------|
-| None                                    | - (только флаг)                               | 1          |
-| Int8 / UInt8 / Bool                     | 1 байт                                        | 2          |
-| Int16 / UInt16                          | 2 байта LE                                    | 3          |
-| Int32 / UInt32 / Float32 / **Date**     | 4 байта LE                                    | 5          |
-| Int64 / UInt64 / Float64 / **DateTime** | 8 байт LE                                     | 9          |
-| Uuid                                    | 16 байт                                       | 17         |
-| String / Bytes / Object                 | 4 байта длины LE + байты                      | 5 + N      |
-| List                                    | 4 байта количества LE + элементы подряд       | 5 + Σ      |
-| Map                                     | 4 байта количества LE + пары (ключ, значение) | 5 + Σ      |
-
-> Нюансы кодирования: `DateTime` хранится как
-> **микросекунды** от эпохи (`timestamp_micros`), а не секунды - чтобы не терять
-> точность Postgres `timestamp(6)`; `Date` хранится как **дни** от эпохи
-> (i32) - компактнее и без часовых поясов; `Object(Vec<u8>)` - «чёрный ящик»:
-> ядро хранит чужие байты (вложенную запись) и не заглядывает внутрь, это основа
-> вложенных моделей.
-
-Методы:
-
-- `size(&self) -> usize` - размер будущего сериализованного представления с учётом флага и длин; используется только в
-  `to_bytes` для преаллокации.
-- `to_bytes(&self) -> Vec<u8>` - преаллоцирует `Vec::with_capacity(self.size())`, вызывает `write_to`, возвращает. **Не
-  используется**.
-- `write_to(&self, buf: &mut Vec<u8>)` (pub(crate)) - рабочая лошадка сериализации: дописывает флаг+payload в чужой
-  буфер без своих аллокаций, рекурсивна для List/Map. Видимость `pub(crate)` - запись значения в чужой буфер -
-  внутренняя кухня `BinaryRecord`, внешние потребители (fury-py, fury-ts) ходят через `set_field`, и формат остаётся
-  закрытым.
-- `from_bytes(bytes, field_type) -> Option<Self>` - обёртка над следующим методом, отбрасывающая хвост. Ей пользуются
-  fury-py `__getattr__` (парсинг одного поля модели), fury-ts `decode` (чтение поля) и `buffer.get_field_value`.
-- `from_bytes_with_rest(bytes, field_type, depth) -> Option<(Self, &[u8])>` - ядро десериализации: разбирает одно
-  значение и возвращает остаток среза. Читает только через `split_first`/`split_at_checked` - никаких panic-индексов:
-  кривой флаг или обрезанный payload дают `None`, а не падение. Для List/Map рекурсивно идёт по элементам, наращивая
-  `depth` до `MAX_DEPTH`. Используется `buffer.from_raw_bytes` в цикле по полям.
-- `is_none(&self) -> bool` - const-проверка на null. **Не используется**.
-
-> Кодек интерпретирует байты **строго по переданному FieldType** - он не угадывает тип. Поэтому буфер и схема должны
-> совпадать (см. buffer.rs): несовпавший тип даёт либо `None`, либо мусорное значение, а не красивую ошибку.
-
-### Buffer
-
-`BinaryRecord` - одна строка модели (например, один пользователь), упакованная
-в обычный `Vec<u8>`. Идея: возить данные как сырые байты и читать отдельные поля
-прямо из этого массива без распаковки всего объекта.
-
-Поля структуры:
-
-- `schema: Arc<ModelSchema>` - схема, по которой собрана запись. `Arc`, потому
-  что одна схема шарится между всеми записями и не копируется;
-- `buffer: Vec<u8>` - сам байтовый буфер;
-- `offsets: HashMap<String, (usize, usize)>` - таблица "имя поля → (с какого
-  байта начинается, сколько байт занимает)". Живёт **только в памяти**, в сам
-  буфер не пишется. Кто получил буфер извне - восстанавливает её заново при
-  парсинге;
-- `is_finished: bool` - «запись финализирована, можно читать байты»;
-- `reopened: bool` - после финализации снова открыли на запись, следующий
-  `finish()` должен сделать компакцию».
-
-Derives на структуре нет: `BinaryRecord` - мутирующий
-builder, выведенный `Clone` провоцировал бы случайные копии буфера, а поведение
-флагов на копии было бы неоднозначным. Нужна копия - есть пара `as_bytes()` +
-`from_raw_bytes()`.
-
-#### Константы и формат буфера (v2, self-describing TLV)
-
-Все магические числа вынесены в именованные константы:
-
-- `SIZE_LEN = 4` - байты общего размера в заголовке (`u32 LE`);
-- `MAGIC_OFFSET = 4` - позиция байта-маркера `'F'` (сразу после размера);
-- `VERSION_OFFSET = 5` - позиция байта версии;
-- `HEADER_SIZE = 6` - заголовок целиком (размер + magic + версия);
-- `NAME_LEN_SIZE = 1` - байт длины имени поля в записи (имена < 256 байт,
-  поэтому `u8` достаточно);
-- `VALUE_LEN_SIZE = 4` - байты длины value-блока в записи (`u32 LE`);
-- `WIRE_MAGIC = b'F'` - маркер «это вообще буфер FuRy»;
-- `WIRE_VERSION = 2` - текущая версия раскладки.
-
-Итоговый буфер выглядит так:
-
-```text
-[4B размер, LE][1B 'F'][1B версия = 2]
-[1B длина имени][имя UTF-8][4B длина value, LE][value-блок]   <- поле 1
-[1B длина имени][имя UTF-8][4B длина value, LE][value-блок]   <- поле 2
-...
+```sh
+cargo run --locked --no-default-features -p fury-core --example roundtrip
+cargo doc --locked --open --no-deps -p fury-core
 ```
 
-`value-блок` - это ровно то, что пишет кодек из `value.rs` (флаг + payload).
-Для `User { id: Int64 = 42, name: String = "bob" }` это 39 байт: 6 заголовка +
-`2 + 9 = 11` поле `id` + `5 + 8 = 13` поле `name` + 9 value.
+## Record lifecycle
 
-Методы:
+Define a `ModelSchema` with named, typed fields and top-level nullability. Create a `BinaryRecord`, write fields, and call `finish()` before exporting bytes. `from_raw_bytes(Vec<u8>, &schema)` takes ownership of a complete frame, validates known fields, and indexes offsets without materializing their values.
 
-* `new(schema)` - создаёт пустую запись: резервирует `HEADER_SIZE + Σ(1 + len(имя) +
-4 + (1+fixed | 1+8))` и пишет `HEADER_SIZE` нулей-заглушек под заголовок.
-  Реальный заголовок впишет `finish()`.
+`get_field_bytes` borrows a known field's encoded payload from the frame. `get_field_value` decodes it into an owned value. Use `update_field` to edit a finished record, then call `finish()` again. Edits preserve retained unknown fields and can compact the frame into a new buffer. Language bindings and the HTTP demo copy data at their own boundaries.
 
-* `write_entry(buf, name, value)` (приватная) - одна точка записи TLV-записи.
-  Последовательно дописывает в буфер: 1 байт длины имени → само имя → 4 байта
-  плейсхолдера под длину value → value-блок через `value.write_to` → замена
-  плейсхолдера реальной длиной. Возвращает координаты value-блока `(start, len)`.
-  Имя длиннее 255 байт - ошибка `Encoding`.
+## Wire v2
 
-* `set_field(name, value)` - вписать одно поле. Проверяет `is_finished` (иначе
-  `BufferAlreadyFinished`), ищет поле в схеме (иначе `FieldNotFound`), дописывает
-  value в конец буфера и запоминает координаты в `offsets`.
+Multi-byte integers and numeric payloads use little-endian byte order. The [codec](src/encoder) and [golden fixtures](tests/fixtures) are the reference implementation and test vectors.
 
-* `get_field_bytes(name)` - O(1) срез value-блока по `offsets`.
-  Это и есть zero-copy: fury-ts `decode` и fury-py `__getattr__` смотрят прямо в
-  сырые байты.
+```text
+frame = u32 total_bytes | 0x46 | 0x02 | field*
+field = u8 name_bytes | UTF-8 name | u32 value_bytes | value
+```
 
-* `get_field_value(name)` - срез через `get_field_bytes` +
-  `ValueType::from_bytes` по типу поля из схемы. `None`, если поля нет или байты
-  не сошлись.
+The length includes all six header bytes. Field lengths count the presence flag. The frame contains field names but carries neither type tags nor a model ID. The caller supplies the schema and determines how messages are framed over the transport.
 
-* `get_field_offset(name)` - отдать сами координаты `(start, len)`.
+Each known value begins with `0x00` for explicit null or `0x01` followed by the payload below. Null has no payload after the flag.
 
-* `finish()` - финализация. Повторный вызов - `BufferAlreadyFinished`. Если
-  `reopened == true` (кто-то мутировал после парсинга), вызывает `rebuild_buffer()`
-  для компакции. Иначе просто `fill_header`: вписывает размер + magic + версию.
+| Schema type | Payload for a present value |
+| --- | --- |
+| Signed or unsigned integer | Fixed width of 1, 2, 4, or 8 bytes, using two's complement for signed values |
+| Float32 or Float64 | IEEE 754 binary32 or binary64 |
+| Bool | One byte, `0` or `1` |
+| Date | Signed i32 days since 1970-01-01 |
+| DateTime | Signed i64 microseconds since the Unix epoch, interpreted as UTC |
+| UUID | 16 raw bytes |
+| String | u32 byte count, followed by UTF-8 bytes |
+| Bytes or Object | u32 byte count, followed by opaque bytes |
+| List | u32 element count, followed by flagged elements |
+| Map | u32 pair count, followed by a flagged key and value per pair |
 
-* `rebuild_buffer()` (приватная) - компакция после мутаций. Проходит по схеме, для
-  каждого установленного поля читает значение через `get_field_value`,
-  пересобирает буфер вплотную
-  через `write_entry`, переписывает offsets и
-  заголовок. Мёртвые байты перезаписанных полей исчезают.
+Top-level null requires a nullable field. A missing field is allowed and remains distinct from a present null. Collection elements carry their own presence flags. The core treats embedded Object bytes as opaque. For validator behavior and temporal range, follow the Rust tests and implementation.
 
-* `as_bytes()` - отдать готовый буфер; если вызвано до `finish()` - `BufferNotFinished`. Используется в:
-  fury-ts `toBytes`, fury-py `create_py_model_instance`.
+Adding fields with new names permits older readers to retain those bytes through edits. Renaming a field or changing its type or nullability requires a coordinated schema migration. Valid legacy duplicates use the last value, and edits may reorder fields. The version byte applies to the record layout. The separate bincode registry depends on the schema enum layout, so build it together with the matching runtime.
 
-* `from_raw_bytes(data, schema)` - парсинг чужого буфера. Валидация: длина не
-  меньше `HEADER_SIZE`, реальный размер равен заголовку (иначе `InvalidSchema`
-  «Integrity mismatch»), magic равен `'F'` (иначе «Not a FuRy buffer»), версия
-  равна `WIRE_VERSION` (иначе «Unsupported wire version»). Потом цикл по байтам
-  буфера (а не по схеме - это главное отличие v2): читает имя, длину value,
-  value-блок. Поле есть в локальной схеме - запоминает координаты; **нет - просто
-  перешагивает по длине**. Обрезанное имя/длина/value - `InvalidSchema` с явной
-  причиной.
+The default `DecodeLimits` allow 16 MiB per frame, 4,096 physical fields, 100,000 items per collection and 100,000 values for fields known to the reader. The hard nesting limit is 16. Limit input at the transport before reading or allocating the body and enforce application-specific bounds on rows and messages.
 
-* `reopen()` - снять finished-флаг, поставить `reopened`; следующий `finish()`
-  сделает компакцию.
+## Integrating a driver or language
 
-`len()/is_empty()/schema()/is_finished()` - геттеры. `is_finished` используется
-fury-ts для решения «нужен ли reopen». **`len`/`is_empty` внутри ядра не
-используются**.
+The `db` feature exposes a PostgreSQL adapter. It uses named columns and bound SQL arguments. Supported projections cover scalar types. The application owns query design, result limits, transaction strategy and transport. See the [Python binding](../fury-py/) for its narrower public API.
 
-> **Справка (эволюция схем).** Поскольку буфер v2 самоописываемый (имена + длины
-> в каждой записи), изменения модели после записи буфера - штатная ситуация.
-> Добавили поле - геттеры вернут `None`; удалили поле - запись перешагивается по
-> длине; поменяли порядок - читается по имени; поменяли тип - кодек не сходится
-> в своём value-блоке и даёт `None`. Чужой/побитый буфер отклоняется явно
-> (`InvalidSchema`). Граница: сам **код** потребителей генерируется из реестра,
-> поэтому после правки модели лучше перезапускать процессы (слепок `OnceLock`) и
-> перегенерируй TS (`fury generate` копирует свежий `.fury_registry.bin` рядом
-> с классами).
-
-
----
-
-## DB-модуль
-
-Мост «Postgres → BinaryRecord» на sqlx. Подключён cargo-фичей `db` (включена
-по умолчанию): fury-ts собирается с `default-features = false`, потому что
-sqlx тянет tokio, который не компилируется под wasm32, а браузеру БД не
-нужна.
-
-### Pool
-
-Обёртка над `Arc<PgPool>`. Derive `Clone` дешёвый: клон - инкремент счётчика
-`Arc`, а не второй пул; именно поэтому executor и `FuryDB` дёшево делят один
-пул. `Debug` реализован вручную: derive потащил бы в логи весь внутренний Debug
-`PgPool` с опциями, а нам достаточно `pool_size` и `idle_connections`.
-
-> **Справка:** конкретный `PgPool`, а не `AnyPool`, потому что драйвер `Any` не
-> реализует `Decode/Type` для chrono/uuid - `try_get::<NaiveDateTime>` на `Any`
-> просто не компилируется. Цена - мульти-DB пока не существует.
-
-Методы:
-
-*`connect(connection_string)` (async) - `PgPool::connect` + сразу
-`pool.acquire()` для fail-fast на старте. Использует fury-py `FuryDB.connect`.
-
-* `inner()` - отдать `&PgPool` executor'у.
-* `is_healthy()` (async) - сетевой `SELECT 1`. O(1–5ms). **Не используется**.
-* `is_healthy_lightweight()` - O(1) без сети: пул не закрыт и (есть idle или
-  размер не упёрся в максимум). **Не гарантирует**, что база реально отвечает.
-  **Не используется**.
-
-### Executor
-
-`QueryExecutor` - выполняет запросы и конвертирует строки БД в `BinaryRecord`.
-Хранит пул и клон реестра (через `Arc`). Derives нет: executor создаётся один
-раз и раздаётся через `Arc`.
-
-Методы:
-
-* `new(pool, schema_registry)` - обычный конструктор.
-* `prepare_query(query, args)` (приватная) - единая точка сборки запроса:
-  биндинг аргументов через `SqlValue::bind_to` + `sqlx::AssertSqlSafe(query)`.
-  AssertSqlSafe - обещание sqlx «ответственность беру на себя», потому что
-  запросы динамические. Обе публичные операции идут через неё - смена драйвера
-  = правка в одном месте.
-* `execute_raw(query, args)` (async) - SELECT: `prepare_query` + `fetch_all`,
-  возвращает `Vec<PgRow>`. Пример использования: fury-py `fetch_one`/`fetch_all`.
-* `execute_affected(query, args)` (async) - INSERT/UPDATE/DELETE: `prepare_query`
-    + `execute`, возвращает `rows_affected()`. Пример использования: fury-py `execute`.
-
-  > Два метода, а не один: протокол Postgres отдаёт command tag и
-  > строки раздельно. `fetch_all` для INSERT без RETURNING вернёт пустой вектор
-  > (affected не восстановить), `execute()` не вернёт строк для SELECT.
-
-* `row_to_buffer(row, schema)` - строка БД → `BinaryRecord`: `new` + для
-  каждого поля схемы `extract_value` + `set_field`.
-* `extract_value(row, field_name, field_type)` (приватная) - извлечение одного
-  поля. **Postgres-драйвер **строгий**: `try_get::<i64>` на INTEGER-колонке
-  падает. Поэтому часть типов читается с fallback**:
-
-  | FieldType          | Сначала                                | Fallback                                 |
-        |--------------------|----------------------------------------|------------------------------------------|
-  | Int8               | -                                      | i16 → i8                                 |
-  | Int16              | i16                                    | -                                        |
-  | Int32              | i32                                    | i16 → i32                                |
-  | Int64              | i64                                    | i32 → i64 (частый случай SERIAL/INTEGER) |
-  | UInt8/UInt16       | -                                      | i16/i32 с кастом                         |
-  | UInt32             | i64 → u32                              | i32 → u32                                |
-  | UInt64             | i64 → u64 (проверка неотрицательности) | -                                        |
-  | Float32            | f32                                    | -                                        |
-  | Float64            | f64                                    | f32 (`REAL`) → f64                       |
-  | Date/DateTime/Uuid | chrono/uuid нативно                    | -                                        |
-  | List/Map/Object    | **`Encoding`**                         | из строки БД не достаются                |
-
-* `schema_registry()` - реестр наружу; используется fury-py `fetch_all`.
-* `pool()` - **не используется**.
-
-Дальше идёт `SqlValue` - аргумент запроса из динамического языка: все числа, float'ы,
-строки, байты, bool, DateTime/Date/Uuid, `Null`. Derives - `Clone, Debug`:
-`Clone` потому, что аргументы переезжают в async-блоки и нужна запасная копия.
-
-Функция `bind_to(self, arguments)` - адаптация к Postgres (unsigned нет):
-`Int8/UInt8 → i16`, `UInt16 → i32`, `UInt32 → i64`; `UInt64` через
-`i64::try_from` с **ошибкой** при переполнении;
-DateTime/Date/Uuid нативно; `Null` биндится как `Option::<i32>::None`.
-
----
+For another database, map its typed result rows to `ValueType` and keep connection handling, null mapping, pagination and errors in the adapter crate. For another language, bind to Rust or implement this wire format. Use the golden fixtures in both directions and check integer range, byte order, null and missing fields, bounds and preservation of unknown fields. See the [workspace README](../README.md) for installation and the browser demo.
