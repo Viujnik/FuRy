@@ -1,14 +1,16 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub use fury_core::schema::registry::get_global_registry;
+use pyo3::prelude::*;
+mod conversion;
+mod db;
+mod errors;
+mod models;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+use db::FuryDB;
+use models::BaseModel;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+#[pymodule]
+fn fury(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<FuryDB>()?;
+    m.add_class::<BaseModel>()?;
+    Ok(())
 }

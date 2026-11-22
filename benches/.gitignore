@@ -1,0 +1,7 @@
+results/2*/
+results/latest
+fixtures/
+python/.venv/
+python/__pycache__/
+node/node_modules/
+rust/target/

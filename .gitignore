@@ -4,7 +4,6 @@
 /target
 **/*.rs.bk
 *.pdb
-Cargo.lock
 
 # =============================================================================
 # PYTHON
@@ -62,7 +61,6 @@ fury-go/*.h
 *.iml
 *.ipr
 *.iws
-
 # VS Code
 .vscode/
 *.code-workspace
@@ -114,6 +112,9 @@ lerna-debug.log*
 # =============================================================================
 # FURY SPECIFIC
 # =============================================================================
+.fury_registry.bin
+.fury_registry.bin.tmp
+/fury-ts/pkg/
 *.bfbs
 fbs_generated/
 

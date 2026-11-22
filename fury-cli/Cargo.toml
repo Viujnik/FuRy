@@ -4,4 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-fury-core = { path = "../fury-core" }
+fury-core = { path = "../fury-core", default-features = false }
+thiserror = "2.0.18"
+clap = { version = "4.6.4", features = ["derive"] }
+regex = "1.13.1"
+unicode-ident = "1"
+
+[[bin]]
+name = "fury"
+path = "src/main.rs"

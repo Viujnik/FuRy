@@ -1,0 +1,13 @@
+{
+  "name": "fury-bench-node",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "description": "Equivalent frontend page workloads across FuRy, JSON and MessagePack.",
+  "scripts": {
+    "bench": "node --expose-gc run.mjs"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "3.0.0"
+  }
+}
