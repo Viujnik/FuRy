@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "fury-core",
+    "fury-py",
+    "fury-cli",
+    "fury-ts",
+    "benches/rust",
+]
+default-members = ["fury-core", "fury-cli"]
+[workspace.dependencies]
+tokio = { version = "1.36", features = ["full"] }
+thiserror = "2.0.18"
+pyo3 = { version = "0.29.0", features = ["experimental-async"] }
+pyo3-async-runtimes = { version = "0.29.0", features = ["tokio-runtime"] }

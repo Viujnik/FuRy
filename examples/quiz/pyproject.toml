@@ -1,0 +1,16 @@
+[project]
+name = "fury-quiz-example"
+version = "0.1.0"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "asyncpg>=0.31,<1",
+    "fastapi>=0.115,<1",
+    "sqlalchemy[asyncio]>=2.0,<2.1",
+    "uvicorn>=0.34,<1",
+]
+
+[tool.uv]
+package = false
+
+[dependency-groups]
+codecs = ["grpcio-tools>=1.80,<2", "pyfory==1.7.8"]

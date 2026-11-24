@@ -1,0 +1,36 @@
+# Postgres configuration is pinned. Don't use `latest`.
+#
+# `synchronous_commit=off` is safe here because the benchmark is read-only;
+# we never measure write durability. The other settings are chosen so a 100 MB
+# dataset fits comfortably in shared_buffers and every query is a pure index
+# or seq scan with no spills.
+services:
+  postgres:
+    image: postgres:17.2-alpine
+    container_name: fury-bench-postgres
+    environment:
+      POSTGRES_USER: fury
+      POSTGRES_PASSWORD: fury
+      POSTGRES_DB: fury_bench
+    ports:
+      # 54329 to avoid colliding with any local Postgres on 5432.
+      - "127.0.0.1:54329:5432"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "synchronous_commit=off"
+      - "-c"
+      - "fsync=off"
+      - "-c"
+      - "full_page_writes=off"
+      - "-c"
+      - "max_connections=20"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U fury -d fury_bench" ]
+      interval: 1s
+      timeout: 2s
+      retries: 30
