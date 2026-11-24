@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const {readFileSync, writeFileSync} = require("node:fs");
-const {loadRegistry, WasmRecord} = require("@fury/wasm-core");
+const {decodePage, loadRegistry, WasmRecord, WasmRegistry} = require("@fury/wasm-core");
 const {Message} = require("./js/out/message");
 const {Summary} = require("./js/out/summary");
 const {update, count} = require("./js/consumer");
@@ -8,6 +8,61 @@ const {update, count} = require("./js/consumer");
 const blob = readFileSync("out/.fury_registry.bin");
 loadRegistry(blob);
 assert.throws(() => loadRegistry(blob.subarray(0, -1)));
+
+const oversized = new Uint8Array(16 * 1024 * 1024 + 1);
+assert.throws(() => new WasmRecord("Message", oversized), /byte limit/);
+assert.throws(() => loadRegistry(oversized), /byte limit/);
+
+const original = new WasmRecord("Message", readFileSync("golden.fury"));
+try {
+    loadRegistry(readFileSync("replacement.registry"));
+    assert.throws(() => loadRegistry(blob.subarray(0, -1)));
+    const replacement = new WasmRecord("Message");
+    try {
+        replacement.setNumber("count", 250);
+        assert.equal(replacement.getNumber("count"), 250);
+        assert.throws(() => replacement.setNumber("id", 1));
+        assert.equal(original.getBigInt("id"), 42n);
+    } finally {
+        replacement.free();
+    }
+} finally {
+    original.free();
+    loadRegistry(blob);
+}
+
+const pageFrames = Buffer.concat([readFileSync("golden.fury"), readFileSync("message.bin")]);
+const scoped = new WasmRegistry(blob);
+const separate = new WasmRegistry(readFileSync("unsigned.registry"));
+assert.throws(() => separate.decodePage("Message", pageFrames, 2));
+assert.deepEqual(scoped.decodePage("Message", pageFrames, 2), [
+    {id: 42n},
+    {id: 9007199254740993n, text: "Café", active: true, note: null},
+]);
+const scopedRecord = scoped.openRecord("Message", readFileSync("golden.fury"));
+assert.equal(scopedRecord.getBigInt("id"), 42n);
+scopedRecord.free();
+separate.free();
+assert.deepEqual(decodePage("Message", pageFrames, 2), [
+    {id: 42},
+    {id: 9007199254740993n, text: "Café", active: true, note: null},
+]);
+assert.deepEqual(decodePage("Message", new Uint8Array(), 0), []);
+assert.throws(() => decodePage("Message", pageFrames, 1));
+assert.throws(() => decodePage("Message", pageFrames.subarray(0, -1), 2));
+assert.throws(() => decodePage("Message", pageFrames, -1));
+assert.throws(() => decodePage("Message", new Uint8Array(16 * 1024 * 1024 + 1), 1));
+Object.defineProperty(Object.prototype, "id", {
+    configurable: true,
+    set() { throw new Error("unexpected inherited setter"); },
+});
+try {
+    assert.deepEqual(decodePage("Message", readFileSync("golden.fury"), 1), [{id: 42}]);
+} finally {
+    delete Object.prototype.id;
+}
+
+scoped.free();
 
 const golden = new Message(readFileSync("golden.fury"));
 try {

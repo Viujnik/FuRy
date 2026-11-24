@@ -1,27 +1,34 @@
-# fury-py
+# Query PostgreSQL from Python
 
-Import `BaseModel` and `FuryDB` from `fury`. Follow the [workspace README](../README.md) to build the Python extension and run the complete browser demo.
-
-## From a query to a frame
+Define a model for the columns an endpoint returns. For example, an account list can return a stable ID and a name.
 
 ```python
 from fury import BaseModel, FuryDB
 
-class Item(BaseModel):
+
+class User(BaseModel):
     id: int
-    title: str
+    display_name: str
 
-db = FuryDB.connect(database_url)
 
-async def item_frame(item_id: int) -> bytes:
-    item = await db.fetch_one(
-        Item, "SELECT id, title FROM items WHERE id = $1", [item_id]
+db = FuryDB.connect(database_url, max_connections=4)
+
+
+async def first_page(org_id: int) -> bytes:
+    return await db.fetch_page(
+        User,
+        "SELECT id, display_name FROM users WHERE org_id = $1 ORDER BY id LIMIT $2::bigint",
+        [org_id, 50],
+        max_rows=50,
     )
-    return item.to_bytes()
 ```
 
-Supply a PostgreSQL connection URL and a matching table. Give selected columns names and SQL types that match the model. `fetch_one` requires exactly one result. `fetch_all` materializes a list, so bound result size in the query. `execute` returns the number of affected rows. The application handles authorization, HTTP responses and transaction boundaries. This API exposes no transaction or streaming cursor object.
+Create the pool at startup. Pass an organization the caller may access. The SQL limit bounds the query and `max_rows` caps the number of frames written into the Python bytes object.
 
-Use runtime Python annotations in schema classes. `int` maps to signed 64-bit, `float` to Float64, and `T | None` makes a field nullable. Other scalar annotations include `str`, `bool`, `bytes`, `date`, `datetime`, and `UUID`. Use timezone-naive values with PostgreSQL `timestamp`; project `timestamptz` explicitly when timezone semantics matter. UUID fields currently read back as strings. The SQL path supports scalar columns; exact `Decimal` and nested SQL results need an explicit application-level projection. `BaseModel()` starts empty. Query results provide the encoded byte buffer.
+Use `fetch_one` when you need exactly one row as a model. Use `fetch_all` for a bounded list of models, for example when Python needs to inspect each row. `execute` returns the number of affected rows. Coordinate multi-statement transactions in your database layer.
 
-Defining a model registers its schema and attempts to update `.fury_registry.bin` in the working directory. For TypeScript generation, use the [CLI](../fury-cli/) with trusted model source and publish the generated registry with the matching client.
+## Describe the type you actually query
+
+Python `int` means signed 64-bit. A field declared `str | None` can hold SQL null. FuRy also supports booleans, bytes, dates, timestamps, floats, and UUID values. Project decimal amounts to exact integer cents when that matches the domain. Use a timezone-naive value for PostgreSQL `timestamp` and choose an explicit conversion for `timestamptz`.
+
+Queries use the descriptor attached to the supplied Python class. The default wire schema name is the class name. If billing and shipping publish different orders in one registry, use distinct names such as `BillingOrder` and `ShippingOrder`. [Generate the client](../fury-cli/README.md)

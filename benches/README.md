@@ -1,5 +1,7 @@
 # FuRy benchmarks
 
+Start with the work your application actually does. For example, a screen showing fifty orders may favor a small response. An export that turns thousands of rows into JavaScript objects may spend more time decoding. The [order-feed example](../examples/quiz/README.md#order-feed-workload) compares both sizes with PostgreSQL, HTTP, and the same fields returned by each codec. It reports gzip sizes separately from the load test.
+
 ## Frontend page
 
 All formats open the same ordered page and perform the same number of operations. There are three scenarios per format.
@@ -37,7 +39,7 @@ node --expose-gc benches/node/check.mjs \
   --out /path/to/empty/paired-results
 ```
 
-The experiment alternates baseline and candidate order across eight independent pairs. Within each pair the two runtimes consume identical bytes. The comparison uses process medians and a one-sided paired sign test. Each scenario uses the median absolute deviation of its baseline log latencies as the noise margin. The significance threshold is corrected for the number of scenarios. The command returns nonzero on a flagged scenario and preserves every sample plus `comparison.json`. Increase the number of trials if variation makes the result inconclusive. A base without a WASM codec has no matching performance comparison.
+The experiment alternates baseline and candidate order across eight independent pairs. For generated fixtures, each runtime encodes the same ordered rows with its native writer. The harness matches the JSON, MessagePack and registry hashes and reports each wire size. With an explicit fixture directory both readers consume the supplied bytes. The comparison uses process medians and a one-sided paired sign test. Each scenario uses the median absolute deviation of its baseline log latencies as the noise margin. The significance threshold is corrected for the number of scenarios. The command returns nonzero on a flagged scenario and preserves every sample plus `comparison.json`. Increase the number of trials if variation makes the result inconclusive. A base without a WASM codec has no matching performance comparison.
 
 ## PostgreSQL and Rust
 

@@ -5,6 +5,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 const MAX_REGISTRY_BYTES: usize = 4 * 1024 * 1024;
@@ -23,10 +24,19 @@ pub fn get_global_registry() -> &'static SchemaRegistry {
 /// Thread-safe runtime registry whose schemas are shared by readers.
 #[derive(Clone, Default)]
 pub struct SchemaRegistry {
-    inner: Arc<RwLock<HashMap<String, Arc<ModelSchema>>>>,
+    inner: Arc<RegistryState>,
+}
+
+#[derive(Default)]
+struct RegistryState {
+    schemas: RwLock<HashMap<String, Arc<ModelSchema>>>,
+    revision: AtomicUsize,
 }
 
 impl SchemaRegistry {
+    /// The maximum number of bytes in an encoded registry.
+    pub const MAX_ENCODED_BYTES: usize = MAX_REGISTRY_BYTES;
+
     /// Loads the working-directory cache when present and valid.
     #[must_use]
     pub fn new() -> Self {
@@ -45,10 +55,52 @@ impl SchemaRegistry {
     }
 
     /// Registers a valid model. Ordinary runtime imports can work in a read-only directory.
-    pub fn register_with_cache(&self, mut schema: ModelSchema, require_cache: bool) -> Result<()> {
+    pub fn register_with_cache(&self, schema: ModelSchema, require_cache: bool) -> Result<()> {
+        self.save_schema(schema, require_cache, false)
+    }
+
+    /// Register an explicit schema ID. Reuse requires an identical descriptor.
+    pub fn register_stable_with_cache(
+        &self,
+        schema: ModelSchema,
+        require_cache: bool,
+    ) -> Result<()> {
+        self.save_schema(schema, require_cache, true)
+    }
+
+    /// Cache generation shared by clones. At saturation callers must look up every schema.
+    pub fn revision(&self) -> Option<usize> {
+        let revision = self.inner.revision.load(Ordering::Acquire);
+        (revision != usize::MAX).then_some(revision)
+    }
+
+    // Writers hold the schema map lock through both the mutation and this update.
+    fn mark_changed(&self) {
+        let revision = self.inner.revision.load(Ordering::Relaxed);
+        self.inner
+            .revision
+            .store(revision.saturating_add(1), Ordering::Release);
+    }
+
+    fn save_schema(
+        &self,
+        mut schema: ModelSchema,
+        require_cache: bool,
+        stable: bool,
+    ) -> Result<()> {
         schema.validate()?;
         schema.field_index = ModelSchema::build_field_index(&schema.fields);
-        let mut map = self.inner.write();
+        let mut map = self.inner.schemas.write();
+        if stable
+            && map
+                .get(schema.name())
+                .is_some_and(|old| old.as_ref() != &schema)
+        {
+            return Err(invalid(format!(
+                "duplicate schema ID '{}' with different fields; use a new version",
+                schema.name(),
+            )));
+        }
         if map.len() >= MAX_MODELS && !map.contains_key(schema.name()) {
             return Err(invalid("too many schemas"));
         }
@@ -72,13 +124,14 @@ impl SchemaRegistry {
             return Err(invalid("this platform has no registry cache file"));
         }
         map.insert(schema.name().to_owned(), Arc::new(schema));
+        self.mark_changed();
         Ok(())
     }
 
     /// Read an entire validated cache and then add or replace its entries atomically.
     pub fn import_cache(&self, bytes: &[u8]) -> Result<()> {
         let parsed = Self::decode_cache(bytes)?;
-        let mut map = self.inner.write();
+        let mut map = self.inner.schemas.write();
         let added = parsed
             .iter()
             .filter(|s| !map.contains_key(s.name()))
@@ -86,9 +139,13 @@ impl SchemaRegistry {
         if added > MAX_MODELS - map.len() {
             return Err(invalid("too many schemas"));
         }
+        if parsed.is_empty() {
+            return Ok(());
+        }
         for schema in parsed {
             map.insert(schema.name().to_owned(), Arc::new(schema));
         }
+        self.mark_changed();
         Ok(())
     }
 
@@ -159,41 +216,45 @@ impl SchemaRegistry {
     /// Retrieves a model schema by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Arc<ModelSchema>> {
-        let map = self.inner.read();
+        let map = self.inner.schemas.read();
         map.get(name).cloned()
     }
 
     /// Checks if a schema with the given name exists.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
-        let map = self.inner.read();
+        let map = self.inner.schemas.read();
         map.contains_key(name)
     }
 
     /// Removes a schema by name and returns it if found.
     pub fn remove(&self, name: &str) -> Option<Arc<ModelSchema>> {
-        let mut map = self.inner.write();
-        map.remove(name)
+        let mut map = self.inner.schemas.write();
+        let removed = map.remove(name);
+        if removed.is_some() {
+            self.mark_changed();
+        }
+        removed
     }
 
     /// Returns the number of registered schemas.
     #[must_use]
     pub fn len(&self) -> usize {
-        let map = self.inner.read();
+        let map = self.inner.schemas.read();
         map.len()
     }
 
     /// Returns `true` if no schemas are registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        let map = self.inner.read();
+        let map = self.inner.schemas.read();
         map.is_empty()
     }
 
     /// Returns a list of all registered model names.
     #[must_use]
     pub fn list_models(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.inner.read().keys().cloned().collect();
+        let mut names: Vec<_> = self.inner.schemas.read().keys().cloned().collect();
         names.sort();
         names
     }
@@ -201,7 +262,7 @@ impl SchemaRegistry {
     /// Returns a vector of all registered model schemas as Arc pointers.
     #[must_use]
     pub fn get_all_schemas(&self) -> Vec<Arc<ModelSchema>> {
-        let mut schemas: Vec<_> = self.inner.read().values().cloned().collect();
+        let mut schemas: Vec<_> = self.inner.schemas.read().values().cloned().collect();
         schemas.sort_by(|a, b| a.name().cmp(b.name()));
         schemas
     }

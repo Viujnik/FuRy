@@ -1,6 +1,6 @@
 # fury-core
 
-The Rust crate provides schema definitions, the wire-v2 codec, and an optional PostgreSQL adapter. Disable default features when you only need schemas and records.
+The Rust crate provides schema definitions, the wire codec, and an optional PostgreSQL adapter. Disable default features when you only need schemas and records.
 
 ```sh
 cargo run --locked --no-default-features -p fury-core --example roundtrip
@@ -13,40 +13,18 @@ Define a `ModelSchema` with named, typed fields and top-level nullability. Creat
 
 `get_field_bytes` borrows a known field's encoded payload from the frame. `get_field_value` decodes it into an owned value. Use `update_field` to edit a finished record, then call `finish()` again. Edits preserve retained unknown fields and can compact the frame into a new buffer. Language bindings and the HTTP demo copy data at their own boundaries.
 
-## Wire v2
+## Wire format
 
-Multi-byte integers and numeric payloads use little-endian byte order. The [codec](src/encoder) and [golden fixtures](tests/fixtures) are the reference implementation and test vectors.
+A complete record containing only `id: Int64 = 42` looks like this:
 
 ```text
-frame = u32 total_bytes | 0x46 | 0x02 | field*
-field = u8 name_bytes | UTF-8 name | u32 value_bytes | value
+0b 00 00 00 | 46 03 | 02 69 64 | 01 | 56
 ```
 
-The length includes all six header bytes. Field lengths count the presence flag. The frame contains field names but carries neither type tags nor a model ID. The caller supplies the schema and determines how messages are framed over the transport.
+The first four bytes give its total size, 11. Next come the letter F, version 3, the length and bytes of the name `id`, the payload length, and the encoded integer. A payload of 255 bytes or more uses the length marker 255 followed by a little-endian u32. A page is a sequence of these frames. An empty page occupies zero bytes.
 
-Each known value begins with `0x00` for explicit null or `0x01` followed by the payload below. Null has no payload after the flag.
+The caller supplies the schema. Marker 0 means null and 1 introduces a full-width value. Integers have shorter forms. Signed values use ZigZag (`0 → 0`, `−1 → 1`, `1 → 2`). A magnitude from 0 through 251 fits directly in one marker, magnitude plus two. Markers 254 and 255 introduce two or four little-endian bytes of the unsigned or ZigZag value when this saves space. Otherwise the writer uses marker 1 and the original integer at its declared width. Thus 42 uses one byte and the largest Int64 uses nine including its marker. For strings, bytes and opaque objects, markers 2 through 255 encode byte lengths through 253. Longer values use marker 1 and a u32 length. Lists and maps use a u32 count and individually marked elements. Date counts days, DateTime counts microseconds, and UUID occupies 16 payload bytes.
 
-| Schema type | Payload for a present value |
-| --- | --- |
-| Signed or unsigned integer | Fixed width of 1, 2, 4, or 8 bytes, using two's complement for signed values |
-| Float32 or Float64 | IEEE 754 binary32 or binary64 |
-| Bool | One byte, `0` or `1` |
-| Date | Signed i32 days since 1970-01-01 |
-| DateTime | Signed i64 microseconds since the Unix epoch, interpreted as UTC |
-| UUID | 16 raw bytes |
-| String | u32 byte count, followed by UTF-8 bytes |
-| Bytes or Object | u32 byte count, followed by opaque bytes |
-| List | u32 element count, followed by flagged elements |
-| Map | u32 pair count, followed by a flagged key and value per pair |
+The reader accepts v2 frames. An untouched record retains the original bytes. After editing, the writer emits v3 and retains unknown fields. Upgrade readers before enabling the new writer. The experimental FP page from the development branch has been removed. A change to an existing field’s type needs a coordinated schema migration. [Frame parser](src/encoder/frame.rs) · [Value encoding](src/encoder/value.rs) · [Compatibility fixtures and checks](tests/wire_contract.rs)
 
-Top-level null requires a nullable field. A missing field is allowed and remains distinct from a present null. Collection elements carry their own presence flags. The core treats embedded Object bytes as opaque. For validator behavior and temporal range, follow the Rust tests and implementation.
-
-Adding fields with new names permits older readers to retain those bytes through edits. Renaming a field or changing its type or nullability requires a coordinated schema migration. Valid legacy duplicates use the last value, and edits may reorder fields. The version byte applies to the record layout. The separate bincode registry depends on the schema enum layout, so build it together with the matching runtime.
-
-The default `DecodeLimits` allow 16 MiB per frame, 4,096 physical fields, 100,000 items per collection and 100,000 values for fields known to the reader. The hard nesting limit is 16. Limit input at the transport before reading or allocating the body and enforce application-specific bounds on rows and messages.
-
-## Integrating a driver or language
-
-The `db` feature exposes a PostgreSQL adapter. It uses named columns and bound SQL arguments. Supported projections cover scalar types. The application owns query design, result limits, transaction strategy and transport. See the [Python binding](../fury-py/) for its narrower public API.
-
-For another database, map its typed result rows to `ValueType` and keep connection handling, null mapping, pagination and errors in the adapter crate. For another language, bind to Rust or implement this wire format. Use the golden fixtures in both directions and check integer range, byte order, null and missing fields, bounds and preservation of unknown fields. See the [workspace README](../README.md) for installation and the browser demo.
+The default limits are 16 MiB per frame, 4,096 fields, 100,000 values and a nesting depth of 16. Bound the incoming HTTP body before buffering it.

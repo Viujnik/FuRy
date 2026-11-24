@@ -34,7 +34,12 @@ pub fn handle_generate(
 
         let mut model_names = extractors::extract_model_names(&src_path, lang)?;
         model_names.sort();
-        model_names.dedup();
+        if let Some(pair) = model_names.windows(2).find(|pair| pair[0] == pair[1]) {
+            return Err(CliError::ParseError(format!(
+                "duplicate schema ID '{}'; give each model a distinct __fury_schema_id__",
+                pair[0]
+            )));
+        }
 
         if model_names.is_empty() {
             return Err(CliError::ParseError(format!("No models found in '{src}'")));

@@ -263,11 +263,57 @@ fn payload_size(c: &mut Criterion) {
     group.finish();
 }
 
+/// Compare fresh page buffers built from identical, pre-existing typed values.
+fn page_encode(c: &mut Criterion) {
+    let schema = Arc::new(ModelSchema::new(
+        "LeaderboardEntry",
+        vec![
+            FieldSchema::new("handle", FieldType::String, false),
+            FieldSchema::new("score", FieldType::Int64, false),
+        ],
+    ));
+    let mut group = c.benchmark_group("page_encode");
+    for (name, rows) in [
+        (
+            "quiz128",
+            (1..=128)
+                .map(|n| (format!("demo-{n:03}"), n % 4))
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "mixed4096",
+            (1i64..=4096)
+                .map(|n| {
+                    let text = format!("user-{n}-{}", "東京".repeat((n % 48) as usize));
+                    (text, n.wrapping_mul(-7046029254386353131))
+                })
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        group.bench_function(BenchmarkId::new("record", name), |b| {
+            b.iter(|| {
+                let mut page = Vec::new();
+                for (text, n) in black_box(&rows) {
+                    let mut record = BinaryRecord::new(Arc::clone(&schema));
+                    record
+                        .set_field("handle", ValueType::String(text.clone()))
+                        .unwrap();
+                    record.set_field("score", ValueType::Int64(*n)).unwrap();
+                    page.extend_from_slice(record.finish().unwrap());
+                }
+                black_box(page)
+            })
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     encode,
     decode_construct,
     decode_access3,
+    page_encode,
     payload_size
 );
 criterion_main!(benches);

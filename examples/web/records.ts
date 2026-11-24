@@ -22,7 +22,7 @@ export async function loadRows(origin: URL): Promise<Row[]> {
     const bytes = await getBytes(origin, "/api/items");
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 
-    // The example response contains complete wire-v2 frames concatenated in row order.
+    // The example response contains complete FuRy frames concatenated in row order.
     const rows: Row[] = [];
     for (let start = 0; start < bytes.length;) {
         if (bytes.length - start < 6 || rows.length === 3) {

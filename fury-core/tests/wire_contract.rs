@@ -41,7 +41,8 @@ fn golden_i64_agrees_in_both_directions() {
     assert_eq!(loaded.get_field_offset("id"), Some((13, 9)));
     let mut builder = BinaryRecord::new(s);
     builder.set_field("id", ValueType::Int64(42)).unwrap();
-    assert_eq!(builder.finish().unwrap(), ID42);
+    assert_eq!(builder.finish().unwrap(), b"\x0b\0\0\0F\x03\x02id\x01\x56");
+    assert_eq!(loaded.as_bytes().unwrap(), ID42);
 }
 
 #[test]
@@ -69,12 +70,17 @@ fn golden_nested_types_keep_boundaries_and_explicit_null() {
         ),
     ];
     let parsed = BinaryRecord::from_raw_bytes(NESTED.to_vec(), &s).unwrap();
-    let mut builder = BinaryRecord::new(s);
-    for (name, value) in values {
+    let mut builder = BinaryRecord::new(s.clone());
+    for (name, value) in values.clone() {
         assert_eq!(parsed.get_field_value(name), Some(value.clone()));
         builder.set_field(name, value).unwrap();
     }
-    assert_eq!(builder.finish().unwrap(), NESTED);
+    let written = builder.finish().unwrap();
+    assert_eq!(written[5], 3);
+    let reread = BinaryRecord::from_raw_bytes(written.to_vec(), &s).unwrap();
+    for (name, value) in values {
+        assert_eq!(reread.get_field_value(name), Some(value));
+    }
 }
 
 #[test]
@@ -126,17 +132,14 @@ fn missing_and_nullable_fields_are_distinct() {
 #[test]
 fn legacy_duplicates_last_win_and_are_compacted_on_edit() {
     let s = id_schema();
-    let first = ValueType::Int64(41).to_bytes();
-    let last = ValueType::Int64(42).to_bytes();
+    let first = [1, 41, 0, 0, 0, 0, 0, 0, 0];
+    let last = [1, 42, 0, 0, 0, 0, 0, 0, 0];
     let bytes = raw_frame(&[("id", &first), ("id", &last)]);
     let mut parsed = BinaryRecord::from_raw_bytes(bytes.clone(), &s).unwrap();
     assert_eq!(parsed.as_bytes().unwrap(), bytes.as_slice());
     assert_eq!(parsed.get_field_value("id"), Some(ValueType::Int64(42)));
     parsed.update_field("id", ValueType::Int64(43)).unwrap();
-    assert_eq!(
-        parsed.finish().unwrap(),
-        raw_frame(&[("id", &ValueType::Int64(43).to_bytes())])
-    );
+    assert_eq!(parsed.finish().unwrap(), b"\x0b\0\0\0F\x03\x02id\x01\x58");
 }
 
 #[test]
@@ -150,7 +153,10 @@ fn opaque_field_survives_new_and_overwritten_known_entries() {
         ("extra", FieldType::Bool, false),
         ("title", FieldType::String, false),
     ]);
-    let title = ValueType::String("Фурия 🚀".into()).to_bytes();
+    let utf8 = "Фурия 🚀".as_bytes();
+    let mut title = vec![1];
+    title.extend_from_slice(&(utf8.len() as u32).to_le_bytes());
+    title.extend_from_slice(utf8);
     let mut record =
         BinaryRecord::from_raw_bytes(raw_frame(&[("id", &ID42[13..]), ("title", &title)]), &old)
             .unwrap();
@@ -209,16 +215,13 @@ fn bounded_compaction_preserves_a_sparse_known_field() {
     let mut record = BinaryRecord::from_raw_bytes_with_limits(ID42.to_vec(), &s, limits).unwrap();
     for n in 42..64 {
         record.update_field("id", ValueType::Int64(n)).unwrap();
-        assert_eq!(record.len(), ID42.len());
+        assert!(record.len() <= ID42.len());
         assert!(record
             .set_field("unused", ValueType::String("x".into()))
             .is_err());
     }
     assert_eq!(record.get_field_value("id"), Some(ValueType::Int64(63)));
-    assert_eq!(
-        record.finish().unwrap(),
-        raw_frame(&[("id", &ValueType::Int64(63).to_bytes())])
-    );
+    assert_eq!(record.finish().unwrap(), b"\x0b\0\0\0F\x03\x02id\x01\x80");
 }
 
 #[test]
@@ -337,5 +340,119 @@ fn deterministic_wire_smoke() {
         for (name, expected) in &input[1..] {
             assert_eq!(edited.get_field_value(name).as_ref(), Some(expected));
         }
+    }
+}
+
+#[test]
+fn adaptive_integers_and_blobs_have_exact_bounded_sizes() {
+    for n in [
+        i64::MIN,
+        -2147483649,
+        -32769,
+        -32768,
+        -127,
+        -126,
+        -1,
+        0,
+        42,
+        125,
+        126,
+        32767,
+        32768,
+        2147483647,
+        2147483648,
+        i64::MAX,
+    ] {
+        let value = ValueType::Int64(n);
+        let bytes = value.to_bytes();
+        assert_eq!(value.size(), bytes.len());
+        assert!(bytes.len() <= 9);
+        assert_eq!(
+            ValueType::from_bytes_with_limits(&bytes, &FieldType::Int64, &DecodeLimits::default()),
+            Some(value)
+        );
+        for end in 0..bytes.len() {
+            assert!(ValueType::from_bytes(&bytes[..end], &FieldType::Int64).is_none());
+        }
+    }
+    for n in [0, 251, 252, 65535, 65536, u32::MAX as u64, u64::MAX] {
+        let value = ValueType::UInt64(n);
+        assert_eq!(
+            ValueType::from_bytes(&value.to_bytes(), &FieldType::UInt64),
+            Some(value)
+        );
+    }
+    let s = schema(&[("v", FieldType::Bytes, false)]);
+    for len in [0, 1, 252, 253, 254, 255, 16384] {
+        let mut r = BinaryRecord::new(s.clone());
+        let value = ValueType::Bytes(vec![42; len]);
+        assert_eq!(value.size(), value.to_bytes().len());
+        r.set_field("v", value.clone()).unwrap();
+        let frame = r.finish().unwrap();
+        let parsed = BinaryRecord::from_raw_bytes(frame.to_vec(), &s).unwrap();
+        assert_eq!(parsed.get_field_value("v"), Some(value));
+    }
+}
+
+#[test]
+fn page_writer_and_record_writer_share_bytes_and_failed_rows_roll_back() {
+    use fury_core::encoder::frame::append_row;
+    let s = id_schema();
+    let mut page = Vec::new();
+    let limits = DecodeLimits {
+        max_frame_bytes: 11,
+        ..DecodeLimits::default()
+    };
+    append_row(&mut page, &s, &limits, |_| Ok(ValueType::Int64(42))).unwrap();
+    assert_eq!(page, b"\x0b\0\0\0F\x03\x02id\x01\x56");
+    assert!(append_row(&mut page, &s, &limits, |_| Ok(ValueType::Int64(42))).is_err());
+    let before = page.clone();
+    assert!(append_row(&mut page, &s, &DecodeLimits::default(), |_| Ok(
+        ValueType::None
+    ))
+    .is_err());
+    assert_eq!(page, before);
+    assert!(BinaryRecord::from_raw_bytes(raw_frame(&[("id", &[0x56])]), &s).is_err());
+}
+
+#[test]
+fn replacing_a_middle_field_retains_known_and_opaque_offsets() {
+    let full = schema(&[
+        ("id", FieldType::Int64, false),
+        ("label", FieldType::String, false),
+        ("extra", FieldType::String, false),
+        ("flag", FieldType::Bool, false),
+    ]);
+    let subset = schema(&[
+        ("id", FieldType::Int64, false),
+        ("label", FieldType::String, false),
+        ("flag", FieldType::Bool, false),
+    ]);
+    let mut initial = BinaryRecord::new(full.clone());
+    initial.set_field("id", ValueType::Int64(42)).unwrap();
+    initial
+        .set_field("label", ValueType::String("a".repeat(300)))
+        .unwrap();
+    initial
+        .set_field("extra", ValueType::String("opaque".into()))
+        .unwrap();
+    initial.set_field("flag", ValueType::Bool(true)).unwrap();
+    let mut bytes = initial.finish().unwrap().to_vec();
+    for label in ["x".to_owned(), "z".repeat(400)] {
+        let mut edit = BinaryRecord::from_raw_bytes(bytes, &subset).unwrap();
+        edit.update_field("label", ValueType::String(label.clone()))
+            .unwrap();
+        assert_eq!(edit.get_field_value("flag"), Some(ValueType::Bool(true)));
+        bytes = edit.finish().unwrap().to_vec();
+        let record = BinaryRecord::from_raw_bytes(bytes.clone(), &full).unwrap();
+        assert_eq!(record.get_field_value("id"), Some(ValueType::Int64(42)));
+        assert_eq!(
+            record.get_field_value("extra"),
+            Some(ValueType::String("opaque".into()))
+        );
+        assert_eq!(
+            record.get_field_value("label"),
+            Some(ValueType::String(label))
+        );
     }
 }

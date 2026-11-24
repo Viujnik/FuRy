@@ -119,8 +119,8 @@ async def emit_fixtures(destination: Path | None) -> None:
 
     blobs = [model.to_bytes() for model in models]
     for blob in blobs:
-        if len(blob) < 6 or struct.unpack_from("<I", blob)[0] != len(blob) or blob[4:6] != b"F\x02":
-            raise RuntimeError("Invalid wire-v2 fixture frame")
+        if len(blob) < 6 or struct.unpack_from("<I", blob)[0] != len(blob) or blob[4:6] != b"F\x03":
+            raise RuntimeError("Invalid wire-v3 fixture frame")
 
     files = {
         "wide.fury": b"".join(blobs),
@@ -133,7 +133,7 @@ async def emit_fixtures(destination: Path | None) -> None:
     metadata = {
         "fixture_version": 2,
         "schema_name": "BenchUser",
-        "fury_layout": "concatenated-v2-frames",
+        "fury_layout": "concatenated-v3-frames",
         "order_by": "id ASC",
         "rows": len(dicts),
         "fields": list(dicts[0]),

@@ -18,6 +18,41 @@ fn field(ty: FieldType, nullable: bool) -> Arc<ModelSchema> {
     ))
 }
 
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL server"]
+async fn bounded_pages_preserve_rows_and_fail_atomically() {
+    let db = database().await;
+    let schema = field(FieldType::Int64, false);
+    let query = "SELECT n FROM generate_series(-1::bigint, $1) AS n ORDER BY n";
+    let args = vec![SqlValue::Int64(2)];
+    let rows = db.execute_raw(query, args.clone()).await.unwrap();
+    let mut expected = Vec::new();
+    for row in rows {
+        let mut record = db.row_to_buffer(&row, &schema).unwrap();
+        record.finish().unwrap();
+        expected.extend_from_slice(record.as_bytes().unwrap());
+    }
+    let page = db
+        .fetch_page(query, args.clone(), &schema, 4)
+        .await
+        .unwrap();
+    assert_eq!(page, expected);
+    {
+        assert!(db
+            .fetch_page(query, args.clone(), &schema, 3)
+            .await
+            .is_err());
+        for invalid in [
+            "SELECT 1::bigint AS n, 2::bigint AS n",
+            "SELECT NULL::bigint AS n",
+            "SELECT '3'::text AS n",
+        ] {
+            assert!(db.fetch_page(invalid, vec![], &schema, 1).await.is_err());
+        }
+        assert!(db.fetch_page(query, args.clone(), &schema, 4).await.is_ok());
+    }
+}
+
 async fn database() -> QueryExecutor {
     let dsn = std::env::var("FURY_TEST_DATABASE_URL").expect("disposable database required");
     QueryExecutor::new(

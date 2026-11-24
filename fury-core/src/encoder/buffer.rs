@@ -1,14 +1,13 @@
-use super::limits::{DecodeBudget, DecodeLimits};
+use super::frame::{
+    finish_frame, length_size, write_entry_header, FrameReader, HEADER as HEADER_SIZE,
+};
+use super::limits::DecodeLimits;
 use super::value::ValueType;
 use crate::error::{FuryError, Result};
 use crate::schema::registry::ModelSchema;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const WIRE_MAGIC: u8 = b'F';
-const WIRE_VERSION: u8 = 2;
-const HEADER_SIZE: usize = 6;
-const ENTRY_HEADER_SIZE: usize = 5;
 const DENSE_INDEX_LIMIT: usize = 4096;
 
 // A frame fits in a u32. A value consumes at least one byte, so its nested
@@ -22,8 +21,13 @@ struct Location {
 }
 
 impl Location {
-    fn entry_len(self) -> usize {
-        (self.start + self.len - self.entry) as usize
+    // Canonical size, including when the original entry came from a v2 frame.
+    fn encoded_len(self, name_len: usize) -> usize {
+        if self.entry == 0 {
+            0
+        } else {
+            1 + name_len + length_size(self.len as usize) + self.len as usize
+        }
     }
 
     fn coordinates(self) -> (usize, usize) {
@@ -34,7 +38,7 @@ impl Location {
 struct Locations {
     // Common known fields share the schema's name index without copying names.
     dense: Vec<Location>,
-    sparse: HashMap<Box<str>, Location>,
+    sparse: Option<HashMap<Box<str>, Location>>,
 }
 
 impl Locations {
@@ -47,12 +51,15 @@ impl Locations {
                     .min(limits.max_fields)
                     .min(DENSE_INDEX_LIMIT)
             ],
-            sparse: HashMap::new(),
+            sparse: None,
         }
     }
 
     fn get(&self, index: usize, name: &str) -> Option<Location> {
-        let location = self.dense.get(index).or_else(|| self.sparse.get(name))?;
+        let location = self
+            .dense
+            .get(index)
+            .or_else(|| self.sparse.as_ref()?.get(name))?;
         (location.entry != 0).then_some(*location)
     }
 
@@ -61,24 +68,26 @@ impl Locations {
             let previous = std::mem::replace(slot, value);
             (previous.entry != 0).then_some(previous)
         } else {
-            self.sparse.insert(name.into(), value)
+            self.sparse
+                .get_or_insert_with(HashMap::new)
+                .insert(name.into(), value)
         }
     }
 
     fn remove(&mut self, index: usize, name: &str) {
         if let Some(slot) = self.dense.get_mut(index) {
             *slot = Location::default();
-        } else {
-            self.sparse.remove(name);
+        } else if let Some(sparse) = &mut self.sparse {
+            sparse.remove(name);
         }
     }
 }
 
-/// A typed record holding a contiguous FuRy wire-v2 frame.
+/// A typed record holding a contiguous FuRy frame.
 ///
 /// Raw field bytes borrow the frame. Typed reads materialize a value.
 /// ```text
-/// [u32 LE frame size]['F'][2] ([u8 name length][name][u32 LE value length][value])*
+/// [u32 LE frame size]['F'][3] ([u8 name length][name][encoded length][value])*
 /// ```
 pub struct BinaryRecord {
     schema: Arc<ModelSchema>,
@@ -108,8 +117,7 @@ impl BinaryRecord {
             .iter()
             .take(limits.max_fields.min(DENSE_INDEX_LIMIT))
             .map(|field| {
-                ENTRY_HEADER_SIZE
-                    + field.name().len().min(u8::MAX as usize)
+                2 + field.name().len().min(u8::MAX as usize)
                     + 1
                     + field.field_type().fixed_size().unwrap_or(8)
             })
@@ -170,12 +178,12 @@ impl BinaryRecord {
         })?;
         let previous = self.offsets.get(index, name).unwrap_or_default();
         let is_new = previous.entry == 0;
-        let entry_len = ENTRY_HEADER_SIZE + name.len();
+        let entry_len = 1 + name.len() + length_size(len);
         let max_bytes = self.limits.max_frame_bytes.min(u32::MAX as usize);
         let size_error = || FuryError::Encoding("record exceeds the configured byte budget".into());
         let entry_len = entry_len.checked_add(len).ok_or_else(size_error)?;
         let live_fields = self.live_fields + usize::from(is_new);
-        let live_bytes = (self.live_bytes - previous.entry_len())
+        let live_bytes = (self.live_bytes - previous.encoded_len(name.len()))
             .checked_add(entry_len)
             .filter(|size| *size <= max_bytes)
             .ok_or_else(size_error)?;
@@ -190,16 +198,20 @@ impl BinaryRecord {
 
         // Byte and value preflights are complete. Compact obsolete entries
         // before appending when keeping them would exceed the frame budget.
-        if entry_len > max_bytes - self.buffer.len() {
+        if self.finished
+            && !self.has_dead_entries
+            && !is_new
+            && entry_len > self.buffer.capacity() - self.buffer.len()
+        {
+            self.close_gap(previous);
+        } else if entry_len > max_bytes - self.buffer.len() {
             self.offsets.remove(index, name);
             self.compact(live_bytes - entry_len);
         } else {
             self.has_dead_entries |= !is_new;
         }
         let entry = self.buffer.len() as u32;
-        self.buffer.push(name.len() as u8);
-        self.buffer.extend_from_slice(name.as_bytes());
-        self.buffer.extend_from_slice(&(len as u32).to_le_bytes());
+        write_entry_header(&mut self.buffer, name.as_bytes(), len);
         let start = self.buffer.len() as u32;
         value.write_to(&mut self.buffer);
         self.offsets.insert(
@@ -258,11 +270,28 @@ impl BinaryRecord {
         if self.has_dead_entries {
             self.compact(self.live_bytes);
         }
-        let len = self.buffer.len() as u32;
-        self.buffer[..4].copy_from_slice(&len.to_le_bytes());
-        self.buffer[4..HEADER_SIZE].copy_from_slice(&[WIRE_MAGIC, WIRE_VERSION]);
+        finish_frame(&mut self.buffer);
         self.finished = true;
         Ok(&self.buffer)
+    }
+
+    // Reclaim one obsolete entry before an edit would grow an otherwise compact buffer.
+    fn close_gap(&mut self, old: Location) {
+        let end = old.start as usize + old.len as usize;
+        let gap = end - old.entry as usize;
+        self.buffer.copy_within(end.., old.entry as usize);
+        self.buffer.truncate(self.buffer.len() - gap);
+        for slot in self
+            .offsets
+            .dense
+            .iter_mut()
+            .chain(self.offsets.sparse.iter_mut().flat_map(HashMap::values_mut))
+        {
+            if slot.entry > old.entry {
+                slot.entry -= gap as u32;
+                slot.start -= gap as u32;
+            }
+        }
     }
 
     // Each location currently points into the old frame. Disjoint live entry
@@ -273,18 +302,37 @@ impl BinaryRecord {
             .dense
             .iter_mut()
             .filter(|slot| slot.entry != 0)
-            .chain(self.offsets.sparse.values_mut())
+            .chain(self.offsets.sparse.iter_mut().flat_map(HashMap::values_mut))
             .collect();
         entries.sort_unstable_by_key(|location| location.entry);
+        if self.buffer[5] != 2 {
+            let mut write = HEADER_SIZE;
+            for location in entries {
+                let entry = location.entry as usize;
+                let (start, len) = location.coordinates();
+                let end = start + len;
+                if write != entry {
+                    self.buffer.copy_within(entry..end, write);
+                }
+                location.entry = write as u32;
+                location.start = (write + (start - entry)) as u32;
+                write += end - entry;
+            }
+            self.buffer.truncate(write);
+            self.has_dead_entries = false;
+            return;
+        }
         let mut buffer = Vec::with_capacity(capacity);
         buffer.extend_from_slice(&[0; HEADER_SIZE]);
         for location in entries {
-            let prefix = location.start - location.entry;
-            let old = location.entry as usize;
-            let len = location.entry_len();
+            let entry = location.entry as usize;
+            let name_len = usize::from(self.buffer[entry]);
+            let name = &self.buffer[entry + 1..entry + 1 + name_len];
+            let (start, len) = location.coordinates();
             location.entry = buffer.len() as u32;
-            location.start = location.entry + prefix;
-            buffer.extend_from_slice(&self.buffer[old..old + len]);
+            write_entry_header(&mut buffer, name, len);
+            location.start = buffer.len() as u32;
+            buffer.extend_from_slice(&self.buffer[start..start + len]);
         }
         self.buffer = buffer;
         self.has_dead_entries = false;
@@ -298,7 +346,7 @@ impl BinaryRecord {
         Ok(&self.buffer)
     }
 
-    /// Parses one complete wire-v2 frame using the default limits.
+    /// Parses one complete FuRy frame using the default limits.
     pub fn from_raw_bytes(data: Vec<u8>, schema: &Arc<ModelSchema>) -> Result<Self> {
         Self::from_raw_bytes_with_limits(data, schema, DecodeLimits::default())
     }
@@ -310,81 +358,32 @@ impl BinaryRecord {
         schema: &Arc<ModelSchema>,
         limits: DecodeLimits,
     ) -> Result<Self> {
-        if data.len() > limits.max_frame_bytes {
-            return Err(FuryError::InvalidSchema("frame exceeds byte limit".into()));
-        }
-        let Some(([a, b, c, d, magic, version], mut rest)) =
-            data.split_first_chunk::<HEADER_SIZE>()
-        else {
-            return Err(FuryError::InvalidSchema("truncated frame header".into()));
-        };
-        if data.len() != u32::from_le_bytes([*a, *b, *c, *d]) as usize {
-            return Err(FuryError::InvalidSchema(
-                "frame length differs from the header".into(),
-            ));
-        }
-        if *magic != WIRE_MAGIC || *version != WIRE_VERSION {
-            return Err(FuryError::InvalidSchema(
-                "expected a FuRy wire-v2 frame".into(),
-            ));
-        }
-
+        let mut reader = FrameReader::new(&data, &limits)?;
         let mut offsets = Locations::new(schema, &limits);
-        let mut budget = DecodeBudget::new(&limits);
-        let mut physical_fields = 0;
         let mut live_fields = 0;
         let mut live_values = 0;
-        let mut live_bytes = data.len();
-        let mut has_dead_entries = false;
-        while let Some((&name_len, tail)) = rest.split_first() {
-            if physical_fields >= limits.max_fields {
-                return Err(FuryError::InvalidSchema("frame exceeds field limit".into()));
-            }
-            physical_fields += 1;
-            let entry = data.len() - rest.len();
-            let (name, tail) = tail
-                .split_at_checked(usize::from(name_len))
-                .ok_or_else(|| FuryError::InvalidSchema("truncated field name".into()))?;
-            let name = std::str::from_utf8(name)
-                .map_err(|_| FuryError::InvalidSchema("invalid UTF-8 field name".into()))?;
-            let (raw_len, tail) = tail
-                .split_first_chunk::<4>()
-                .ok_or_else(|| FuryError::InvalidSchema("truncated field length".into()))?;
-            let len = u32::from_le_bytes(*raw_len);
-            let (raw, tail) = tail
-                .split_at_checked(len as usize)
-                .ok_or_else(|| FuryError::InvalidSchema("truncated field value".into()))?;
-
-            let index = schema.field_index(name);
-            let before = budget.remaining;
-            if let Some(i) = index {
-                let field = &schema.fields()[i];
-                if (!field.is_nullable() && raw.first() == Some(&0))
-                    || !ValueType::validate_bytes(raw, field.field_type(), &mut budget)
-                {
-                    return Err(FuryError::InvalidSchema(
-                        format!("invalid value for field '{name}'").into(),
-                    ));
-                }
-            }
-            let values = before - budget.remaining;
+        let legacy = data[5] == 2;
+        let mut live_bytes = if legacy { HEADER_SIZE } else { data.len() };
+        let mut has_dead_entries = legacy;
+        while let Some(field) = reader.next_field(schema)? {
             let location = Location {
-                entry: entry as u32,
-                start: (entry + ENTRY_HEADER_SIZE + name.len()) as u32,
-                len,
-                values: values as u32,
+                entry: field.entry as u32,
+                start: field.start as u32,
+                len: field.payload.len() as u32,
+                values: field.values as u32,
             };
-            if let Some(previous) = offsets.insert(index, name, location) {
+            if let Some(previous) = offsets.insert(field.index, field.name, location) {
                 has_dead_entries = true;
                 live_values -= previous.values as usize;
-                live_bytes -= previous.entry_len();
+                live_bytes -= previous.encoded_len(field.name.len());
             } else {
                 live_fields += 1;
             }
-            live_values += values;
-            rest = tail;
+            live_values += field.values;
+            if legacy {
+                live_bytes += location.encoded_len(field.name.len());
+            }
         }
-
         Ok(Self {
             buffer: data,
             offsets,

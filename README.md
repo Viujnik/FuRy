@@ -1,15 +1,73 @@
 # FuRy
 
-FuRy sends typed PostgreSQL rows from a Python service to a TypeScript client as binary records. Define a Python model, query a bounded page, and generate a TypeScript class and its schema registry. The client can read individual fields from each record and use `BigInt` for exact 64-bit integers.
+Suppose your Python service has a page that lists users from PostgreSQL. The browser needs the user IDs and display names. With FuRy, the service can return those columns as binary data, and the browser can read them through WebAssembly. The rest of the application can keep its regular JSON routes.
 
-FuRy is experimental and builds from source. The supported path is a bounded PostgreSQL read served by Python and decoded by a browser client. You can add one binary endpoint alongside your existing routes.
+FuRy is experimental. The examples exercise PostgreSQL, Python, and JavaScript or TypeScript. The application still decides who may see the users, how to page through them, and which format the client accepts.
 
-## Run the demo
+## Run your first site
 
-Use macOS or Linux (including WSL). Install [Git](https://git-scm.com/install/), [Rustup](https://rustup.rs/), [Python 3.14](https://www.python.org/downloads/), [Node 22 with npm](https://nodejs.org/en/download) and the [PostgreSQL server tools](https://www.postgresql.org/download/). Make sure `initdb` and `pg_ctl` are on `PATH`. When `pg_config` is available, `export PATH="$(pg_config --bindir):$PATH"` adds the PostgreSQL binary directory.
+With the build tools listed below, uv and PostgreSQL installed, run this from the repository root:
 
 ```sh
-git clone --branch experimental https://github.com/Viujnik/FuRy.git
+bash examples/quiz/run.sh
+```
+
+Open the printed address, play a round and save your score. To change the topic, edit the [questions](examples/quiz/questions.py) and restart the example. You can follow your change from the browser form through to a stored score. [Setup, smoke test and codec benchmarks](examples/quiz/README.md)
+
+## Follow one user from the database to the browser
+
+Assume the table has three required columns, `id bigint`, `org_id bigint`, and `display_name text`. The endpoint exposes two of them. The class name supplies the schema name.
+
+```python
+from fury import BaseModel, FuryDB
+
+
+class User(BaseModel):
+    id: int
+    display_name: str
+
+
+async def user_page(db: FuryDB, authorized_org_id: int) -> bytes:
+    return await db.fetch_page(
+        User,
+        """
+        SELECT id, display_name FROM users
+        WHERE org_id = $1 ORDER BY id LIMIT $2::bigint
+        """,
+        [authorized_org_id, 50],
+        max_rows=50,
+    )
+```
+
+Open the pool during service startup. After authorizing the request, return the bytes from the route. Publish the matching registry with the client.
+
+```typescript
+import init, { WasmRegistry } from "@fury/wasm-core";
+
+await init();
+const registryResponse = await fetch("/registry.bin");
+if (!registryResponse.ok) throw new Error("Could not load the user schema");
+const registry = new WasmRegistry(new Uint8Array(await registryResponse.arrayBuffer()));
+
+const response = await fetch("/api/v1/users.fury");
+if (!response.ok) throw new Error("Could not load users");
+
+const users = registry.decodePage(
+    "User", new Uint8Array(await response.arrayBuffer()), 50,
+);
+for (const user of users) console.log(user.id.toString(), user.display_name);
+```
+
+The page decoder returns an `id` as `bigint`, so a valid PostgreSQL ID such as `9007199254740993` arrives exactly. The SQL query keeps each page small, and the decoder applies its own byte and row limits.
+
+## Run a complete example
+
+The [browser walkthrough](examples/web/INTERNALS.md) serves three inspectable records. [Quick Quiz](examples/quiz/README.md) adds FastAPI, a browser interface, and a benchmark with JSON, Protobuf, and Apache Fory. Its order-feed workload also measures larger pages with a SQL join.
+
+Use macOS or Linux, including WSL. Install Git, Rustup, Python 3.14, Node 22 with npm, and the PostgreSQL server tools. Put `initdb` and `pg_ctl` on `PATH`.
+
+```sh
+git clone --branch develop https://github.com/Viujnik/FuRy.git
 cd FuRy
 rustup toolchain install 1.94.1 --profile minimal --target wasm32-unknown-unknown
 export RUSTUP_TOOLCHAIN=1.94.1
@@ -20,46 +78,12 @@ python -m pip install maturin==1.14.1
 bash scripts/test-postgres-local.sh web-serve
 ```
 
-In an existing checkout, begin with the toolchain command. Open the URL printed in the terminal. The script builds and installs the bindings, starts a disposable PostgreSQL cluster, and serves sample rows on loopback. Press **Ctrl+C** to stop it. The first build can take several minutes. To verify the pipeline without opening the page, run `bash scripts/test-postgres-local.sh web`.
+The script builds the bindings, opens a temporary database, and prints a loopback URL. Open it in a browser and press **Ctrl+C** in the terminal when finished. Use `bash scripts/test-postgres-local.sh web` to run the automated round trip.
 
-## Use it in an existing Python service
+## What goes on the wire
 
-Construct a `FuryDB` once during service startup. This example assumes `items` has a non-null integer `id` and non-null text `title`.
+A page contains the same self-contained frames you get from individual models. An empty page occupies zero bytes. A frame with just `id = 42` occupies 11 bytes, including its field name and a one-byte integer. A reader opens each frame independently and can retain unfamiliar fields through an edit.
 
-```python
-from fury import BaseModel, FuryDB
+Smaller responses and faster decoding are separate measurements. The order-feed example compares both under the same local workload, with raw sizes and gzip sizes. [Benchmark guide](benches/README.md)
 
-
-class Item(BaseModel):
-    id: int
-    title: str
-
-
-async def item_page(db: FuryDB) -> bytes:
-    rows = await db.fetch_all(
-        Item,
-        "SELECT id::bigint AS id, title FROM items ORDER BY id LIMIT $1::bigint",
-        [100],
-    )
-    return b"".join(row.to_bytes() for row in rows)
-```
-
-Return these bytes with `Content-Type: application/octet-stream`. The demo splits concatenated records by their wire-v2 length headers. Generate the model and registry together, then initialize the browser runtime with that registry. The application retains routing, access control, business validation and the database write path.
-
-- [Python and PostgreSQL API](fury-py/README.md)
-- [CLI and TypeScript generation](fury-cli/README.md)
-- [WASM client and value types](fury-ts/README.md)
-- [Rust codec and wire-v2 contract](fury-core/README.md)
-
-## Integration limits
-
-- `fetch_all` materializes the result. Bound result size in SQL. The Python binding uses its own PostgreSQL pool and exposes no transaction API for coordinating writes with another ORM.
-- The Python producer builds records from query results. Arbitrary Python objects, decimals, and complete nested model support are outside the current binding contract. Map application-specific values explicitly before they reach the wire.
-- Use a matching wheel, registry and WASM runtime. Regenerate pre-hardening registries for optional Python fields and check stored frames before upgrading.
-- Other databases and languages need their own integration and compatibility tests.
-
-## Benchmarks and development
-
-The benchmark suite compares FuRy, JSON and MessagePack on identical Node page workloads. The Rust suite measures codec operations separately. See the [commands, fixtures and measurement scope](benches/README.md).
-
-[Runtime walkthrough](examples/web/INTERNALS.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [Changelog](CHANGELOG.md) · [Apache-2.0 license](LICENSE)
+Find the next step in the API guides for [Python](fury-py/README.md), [generation](fury-cli/README.md), [WASM](fury-ts/README.md), or [Rust and the wire format](fury-core/README.md). For repository work, see [Contributing](CONTRIBUTING.md), [Security](SECURITY.md), [Changelog](CHANGELOG.md), and the [Apache-2.0 license](LICENSE).

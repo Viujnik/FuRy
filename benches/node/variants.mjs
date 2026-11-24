@@ -19,8 +19,7 @@ export const ALL_VARIANTS = [
   'fury_construct_only', 'fury_construct_read3', 'fury_update_roundtrip',
 ];
 
-export async function loadWasm() {
-  const path = process.env.FURY_BENCH_WASM;
+export async function loadWasm(path = process.env.FURY_BENCH_WASM) {
   if (!path) throw new Error('FURY_BENCH_WASM must point to Node-target fury_ts.js');
   return import(pathToFileURL(resolve(path)).href);
 }
@@ -42,11 +41,17 @@ function fieldsFromFrame(frame) {
   const fields = new Map();
   for (let pos = 6; pos < frame.length;) {
     const nameSize = frame[pos++];
-    assert.ok(pos + nameSize + 4 <= frame.length);
+    assert.ok(pos + nameSize + 1 <= frame.length);
     const name = Buffer.from(frame.subarray(pos, pos + nameSize)).toString('utf8');
     pos += nameSize;
-    const size = view.getUint32(pos, true);
-    pos += 4;
+    let size;
+    if (frame[5] === 2 || frame[pos] === 255) {
+      if (frame[5] === 3) pos++;
+      size = view.getUint32(pos, true);
+      pos += 4;
+    } else {
+      size = frame[pos++];
+    }
     assert.ok(pos + size <= frame.length && !fields.has(name));
     fields.set(name, Buffer.from(frame.subarray(pos, pos + size)));
     pos += size;
@@ -63,7 +68,7 @@ export async function prepareVariant(variant, fixtureDir) {
   if (!ALL_VARIANTS.includes(variant)) throw new Error(`Unknown benchmark: ${variant}`);
   const metadata = JSON.parse(await readFile(join(fixtureDir, 'metadata.json'), 'utf8'));
   const { rows, read3_checksum: expectedChecksum, schema_name: schema } = metadata;
-  if (metadata.fixture_version !== 2 || metadata.fury_layout !== 'concatenated-v2-frames'
+  if (metadata.fixture_version !== 2 || !['concatenated-v2-frames', 'concatenated-v3-frames'].includes(metadata.fury_layout)
       || !Number.isSafeInteger(rows) || rows < 1 || rows > 10000
       || schema !== 'BenchUser' || metadata.order_by !== 'id ASC'
       || !Number.isSafeInteger(expectedChecksum)) {

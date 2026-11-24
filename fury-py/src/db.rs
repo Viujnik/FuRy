@@ -1,12 +1,12 @@
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyBytes, PyList};
 use pyo3_async_runtimes::tokio::future_into_py;
 use std::sync::Arc;
 
 use crate::conversion::python_to_sql_value;
 use crate::errors::fury_error_to_pyerr;
 use crate::get_global_registry;
-use crate::models::create_py_model_instance;
+use crate::models::{create_py_model_instance, model_schema};
 use fury_core::db::executor::QueryExecutor;
 use fury_core::db::executor::SqlValue;
 use fury_core::db::pool::DatabasePool;
@@ -42,9 +42,13 @@ impl FuryDB {
     ///
     /// Returns `RuntimeError` if the connection fails or the database is unreachable.
     #[staticmethod]
-    fn connect(connection_string: &str) -> PyResult<Self> {
+    #[pyo3(signature = (connection_string, *, max_connections=None))]
+    fn connect(connection_string: &str, max_connections: Option<u32>) -> PyResult<Self> {
         let pool = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(DatabasePool::connect(connection_string))
+            .block_on(DatabasePool::connect_with_limit(
+                connection_string,
+                max_connections,
+            ))
             .map_err(fury_error_to_pyerr)?;
 
         let registry = get_global_registry().clone();
@@ -74,7 +78,7 @@ impl FuryDB {
         query: String,
         args: Option<Bound<'py, PyList>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let model_name: String = model_class.getattr("__name__")?.extract()?;
+        let schema = model_schema(&model_class)?;
         let sql_args = parse_sql_args(args)?;
         let executor = Arc::clone(&self.executor);
 
@@ -92,10 +96,6 @@ impl FuryDB {
                     actual: rows.len(),
                 }));
             }
-
-            let schema = get_global_registry().get(&model_name).ok_or_else(|| {
-                fury_error_to_pyerr(FuryError::SchemaNotFound(Arc::from(model_name)))
-            })?;
 
             let mut buffer = executor
                 .row_to_buffer(&rows[0], &schema)
@@ -132,7 +132,7 @@ impl FuryDB {
         query: String,
         args: Option<Bound<'py, PyList>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let model_name: String = model_class.getattr("__name__")?.extract()?;
+        let schema = model_schema(&model_class)?;
         let sql_args = parse_sql_args(args)?;
         let executor = Arc::clone(&self.executor);
 
@@ -143,10 +143,6 @@ impl FuryDB {
                 .execute_raw(&query, sql_args)
                 .await
                 .map_err(fury_error_to_pyerr)?;
-
-            let schema = executor.schema_registry().get(&model_name).ok_or_else(|| {
-                fury_error_to_pyerr(FuryError::SchemaNotFound(Arc::from(model_name)))
-            })?;
 
             let mut buffers = Vec::with_capacity(rows.len());
             for row in rows {
@@ -169,6 +165,29 @@ impl FuryDB {
 
                 Ok(list.into_any().unbind())
             })
+        })
+    }
+
+    /// Streams a query into a bounded binary page without materializing Python row models.
+    /// Each row uses the same frame as a single model.
+    #[pyo3(name = "fetch_page", signature = (model_class, query, args=None, *, max_rows=1000))]
+    fn py_fetch_page<'py>(
+        &self,
+        py: Python<'py>,
+        model_class: Bound<'py, PyAny>,
+        query: String,
+        args: Option<Bound<'py, PyList>>,
+        max_rows: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let schema = model_schema(&model_class)?;
+        let executor = Arc::clone(&self.executor);
+        let sql_args = parse_sql_args(args)?;
+        future_into_py(py, async move {
+            let bytes = executor
+                .fetch_page(&query, sql_args, &schema, max_rows)
+                .await
+                .map_err(fury_error_to_pyerr)?;
+            Ok(Python::attach(|py| PyBytes::new(py, &bytes).unbind()))
         })
     }
 

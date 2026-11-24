@@ -28,6 +28,95 @@ macro_rules! write_primitive {
     }};
 }
 
+// Codes 0 and 1 retain their v2 meanings. For an integer, codes 2..=253
+// carry a small value directly. The two remaining codes shorten larger words.
+fn zigzag(value: i64) -> u64 {
+    ((value as u64) << 1) ^ ((value >> 63) as u64)
+}
+
+fn integer_tag(magnitude: u64, width: usize) -> (u8, usize) {
+    if magnitude <= 251 {
+        (magnitude as u8 + 2, 0)
+    } else if width > 2 && magnitude <= u16::MAX.into() {
+        (254, 2)
+    } else if width > 4 && magnitude <= u32::MAX.into() {
+        (255, 4)
+    } else {
+        (FLAG_SOME, width)
+    }
+}
+
+fn short_integer<'a>(tag: u8, data: &'a [u8], ty: &FieldType) -> Option<(ValueType, &'a [u8])> {
+    let width = ty.fixed_size()?;
+    let (magnitude, rest) = match tag {
+        2..=253 => (u64::from(tag - 2), data),
+        254 if width > 2 => {
+            let (bytes, rest) = data.split_first_chunk::<2>()?;
+            (u64::from(u16::from_le_bytes(*bytes)), rest)
+        }
+        255 if width > 4 => {
+            let (bytes, rest) = data.split_first_chunk::<4>()?;
+            (u64::from(u32::from_le_bytes(*bytes)), rest)
+        }
+        _ => return None,
+    };
+    if integer_tag(magnitude, width).0 != tag {
+        return None;
+    }
+    let signed = (magnitude >> 1) as i64 ^ -((magnitude & 1) as i64);
+    let value = match ty {
+        FieldType::Int8 => ValueType::Int8(signed as i8),
+        FieldType::Int16 => ValueType::Int16(signed as i16),
+        FieldType::Int32 => ValueType::Int32(signed as i32),
+        FieldType::Int64 => ValueType::Int64(signed),
+        FieldType::UInt8 => ValueType::UInt8(magnitude as u8),
+        FieldType::UInt16 => ValueType::UInt16(magnitude as u16),
+        FieldType::UInt32 => ValueType::UInt32(magnitude as u32),
+        FieldType::UInt64 => ValueType::UInt64(magnitude),
+        _ => return None,
+    };
+    Some((value, rest))
+}
+
+fn write_integer(buf: &mut Vec<u8>, magnitude: u64, raw: &[u8]) {
+    let (tag, len) = integer_tag(magnitude, raw.len());
+    buf.push(tag);
+    if tag == FLAG_SOME {
+        buf.extend_from_slice(raw);
+    } else {
+        buf.extend_from_slice(&magnitude.to_le_bytes()[..len]);
+    }
+}
+
+fn write_blob(buf: &mut Vec<u8>, bytes: &[u8]) {
+    if bytes.len() <= 253 {
+        buf.push(bytes.len() as u8 + 2);
+    } else {
+        buf.push(FLAG_SOME);
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    }
+    buf.extend_from_slice(bytes);
+}
+
+fn blob_type(ty: &FieldType) -> bool {
+    matches!(
+        ty,
+        FieldType::String | FieldType::Bytes | FieldType::Object(_)
+    )
+}
+
+/// Borrow a present blob and its unconsumed tail.
+pub(super) fn read_blob(tag: u8, data: &[u8], short_values: bool) -> Option<(&[u8], &[u8])> {
+    match tag {
+        FLAG_SOME => {
+            let (raw, tail) = data.split_first_chunk::<4>()?;
+            tail.split_at_checked(u32::from_le_bytes(*raw) as usize)
+        }
+        2..=255 if short_values => data.split_at_checked(usize::from(tag - 2)),
+        _ => None,
+    }
+}
+
 /// A dynamically-typed value that can be serialized to/from binary format.
 ///
 /// Supports primitive types (integers, floats, bool), strings, bytes,
@@ -37,7 +126,8 @@ macro_rules! write_primitive {
 ///
 /// Each value is prefixed with a flag byte:
 /// - `0x00` (FLAG_NONE) — null value
-/// - `0x01` (FLAG_SOME) — value present, followed by type-specific data
+/// - `0x01` (FLAG_SOME) — full-width present value
+/// - `0x02..=0xff` — short integer or blob as determined by the schema
 ///
 /// # Zero-Copy Access
 ///
@@ -118,14 +208,20 @@ impl ValueType {
         match self {
             // do not forget about 1 byte for the flag
             Self::None => 1,
-            Self::Int8(_) | Self::UInt8(_) | Self::Bool(_) => 2,
-            Self::Int16(_) | Self::UInt16(_) => 3,
-            Self::Int32(_) | Self::UInt32(_) | Self::Float32(_) | Self::Date(_) => 5,
-            Self::Int64(_) | Self::UInt64(_) | Self::Float64(_) | Self::DateTime(_) => 9,
+            Self::Int8(v) => 1 + integer_tag(zigzag(*v as i64), 1).1,
+            Self::UInt8(v) => 1 + integer_tag(*v as u64, 1).1,
+            Self::Int16(v) => 1 + integer_tag(zigzag(*v as i64), 2).1,
+            Self::UInt16(v) => 1 + integer_tag(*v as u64, 2).1,
+            Self::Int32(v) => 1 + integer_tag(zigzag(*v as i64), 4).1,
+            Self::UInt32(v) => 1 + integer_tag(*v as u64, 4).1,
+            Self::Int64(v) => 1 + integer_tag(zigzag(*v), 8).1,
+            Self::UInt64(v) => 1 + integer_tag(*v, 8).1,
+            Self::Bool(_) => 2,
+            Self::Float32(_) | Self::Date(_) => 5,
+            Self::Float64(_) | Self::DateTime(_) => 9,
             Self::Uuid(_) => 17,
-            // and 4 bytes for the length info
-            Self::String(s) => 5 + s.len(),
-            Self::Bytes(b) => 5 + b.len(),
+            Self::String(s) => blob_size(s.len()),
+            Self::Bytes(b) => blob_size(b.len()),
             Self::List(items) => 5 + items.iter().map(|item| item.size()).sum::<usize>(),
             Self::Map(entries) => {
                 5 + entries
@@ -133,7 +229,7 @@ impl ValueType {
                     .map(|(k, v)| k.size() + v.size())
                     .sum::<usize>()
             }
-            Self::Object(buffer) => 5 + buffer.len(),
+            Self::Object(buffer) => blob_size(buffer.len()),
         }
     }
     /// Serializes this value into a new byte vector.
@@ -156,15 +252,15 @@ impl ValueType {
     pub(crate) fn write_to(&self, buf: &mut Vec<u8>) {
         match self {
             Self::None => buf.push(FLAG_NONE),
-            Self::Int8(v) => write_primitive!(buf, v),
-            Self::UInt8(v) => write_primitive!(buf, v),
-            Self::Int16(v) => write_primitive!(buf, v),
-            Self::UInt16(v) => write_primitive!(buf, v),
-            Self::Int32(v) => write_primitive!(buf, v),
-            Self::UInt32(v) => write_primitive!(buf, v),
+            Self::Int8(v) => write_integer(buf, zigzag(i64::from(*v)), &v.to_le_bytes()),
+            Self::UInt8(v) => write_integer(buf, *v as u64, &v.to_le_bytes()),
+            Self::Int16(v) => write_integer(buf, zigzag(i64::from(*v)), &v.to_le_bytes()),
+            Self::UInt16(v) => write_integer(buf, *v as u64, &v.to_le_bytes()),
+            Self::Int32(v) => write_integer(buf, zigzag(i64::from(*v)), &v.to_le_bytes()),
+            Self::UInt32(v) => write_integer(buf, *v as u64, &v.to_le_bytes()),
             Self::Float32(v) => write_primitive!(buf, v),
-            Self::Int64(v) => write_primitive!(buf, v),
-            Self::UInt64(v) => write_primitive!(buf, v),
+            Self::Int64(v) => write_integer(buf, zigzag(*v), &v.to_le_bytes()),
+            Self::UInt64(v) => write_integer(buf, *v, &v.to_le_bytes()),
             Self::Float64(v) => write_primitive!(buf, v),
             Self::Bool(v) => {
                 buf.push(FLAG_SOME);
@@ -183,22 +279,8 @@ impl ValueType {
                 buf.push(FLAG_SOME);
                 buf.extend_from_slice(u.as_bytes());
             }
-            Self::String(s) => {
-                buf.push(FLAG_SOME);
-                let s_bytes = s.as_bytes();
-                buf.extend_from_slice(&(s_bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(s_bytes);
-            }
-            Self::Bytes(b) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                buf.extend_from_slice(b);
-            }
-            Self::Object(buffer) => {
-                buf.push(FLAG_SOME);
-                buf.extend_from_slice(&(buffer.len() as u32).to_le_bytes());
-                buf.extend_from_slice(buffer);
-            }
+            Self::String(s) => write_blob(buf, s.as_bytes()),
+            Self::Bytes(bytes) | Self::Object(bytes) => write_blob(buf, bytes),
             Self::List(items) => {
                 buf.push(FLAG_SOME);
                 buf.extend_from_slice(&(items.len() as u32).to_le_bytes());
@@ -263,8 +345,18 @@ impl ValueType {
         if flag == FLAG_NONE {
             return Some(data);
         }
+        if blob_type(ty) {
+            let (bytes, rest) = read_blob(flag, data, budget.short_values)?;
+            if matches!(ty, FieldType::String) {
+                std::str::from_utf8(bytes).ok()?;
+            }
+            return Some(rest);
+        }
         if flag != FLAG_SOME {
-            return None;
+            if !budget.short_values {
+                return None;
+            }
+            return short_integer(flag, data, ty).map(|(_, rest)| rest);
         }
         if let Some(size) = ty.fixed_size() {
             let (raw, rest) = data.split_at_checked(size)?;
@@ -285,13 +377,6 @@ impl ValueType {
         let (raw_len, mut rest) = data.split_at_checked(4)?;
         let count = u32::from_le_bytes(raw_len.try_into().ok()?) as usize;
         match ty {
-            FieldType::String | FieldType::Bytes | FieldType::Object(_) => {
-                let (payload, tail) = rest.split_at_checked(count)?;
-                if matches!(ty, FieldType::String) {
-                    std::str::from_utf8(payload).ok()?;
-                }
-                Some(tail)
-            }
             FieldType::List(inner) => {
                 if count > rest.len()
                     || count > budget.limits.max_collection_items
@@ -364,8 +449,8 @@ impl ValueType {
             return Some((Self::None, data));
         }
 
-        if flag != FLAG_SOME {
-            return None;
+        if flag != FLAG_SOME && !blob_type(field_type) {
+            return short_integer(flag, data, field_type);
         }
 
         match field_type {
@@ -440,25 +525,14 @@ impl ValueType {
                 let uuid = Uuid::from_slice(raw).ok()?;
                 Some((Self::Uuid(uuid), rest))
             }
-            FieldType::String => {
-                let (len_bytes, rest) = data.split_at_checked(4)?;
-                let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
-                let (str_bytes, final_rest) = rest.split_at_checked(len)?;
-
-                let s = std::str::from_utf8(str_bytes).ok()?.to_string();
-                Some((Self::String(s), final_rest))
-            }
-            FieldType::Bytes => {
-                let (len_bytes, rest) = data.split_at_checked(4)?;
-                let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
-                let (b_bytes, final_rest) = rest.split_at_checked(len)?;
-                Some((Self::Bytes(b_bytes.to_vec()), final_rest))
-            }
-            FieldType::Object(_) => {
-                let (len_bytes, rest) = data.split_at_checked(4)?;
-                let len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
-                let (obj_bytes, final_rest) = rest.split_at_checked(len)?;
-                Some((Self::Object(obj_bytes.to_vec()), final_rest))
+            FieldType::String | FieldType::Bytes | FieldType::Object(_) => {
+                let (bytes, rest) = read_blob(flag, data, budget.short_values)?;
+                let value = match field_type {
+                    FieldType::String => Self::String(std::str::from_utf8(bytes).ok()?.to_owned()),
+                    FieldType::Bytes => Self::Bytes(bytes.to_vec()),
+                    _ => Self::Object(bytes.to_vec()),
+                };
+                Some((value, rest))
             }
             FieldType::List(item_type) => {
                 let (len_bytes, mut current_data) = data.split_at_checked(4)?;
@@ -552,10 +626,14 @@ impl ValueType {
     }
 }
 
-/// Add the one-byte flag and four-byte length prefix to a representable payload.
+/// Count the short or extended header for a representable blob.
 fn checked_variable_size(length: usize) -> Option<usize> {
     if length > u32::MAX as usize {
         return None;
     }
-    length.checked_add(5)
+    length.checked_add(if length <= 253 { 1 } else { 5 })
+}
+
+fn blob_size(length: usize) -> usize {
+    length + if length <= 253 { 1 } else { 5 }
 }

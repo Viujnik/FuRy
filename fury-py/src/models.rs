@@ -4,8 +4,8 @@ use chrono::{Datelike, Timelike};
 use fury_core::encoder::buffer::BinaryRecord;
 use fury_core::encoder::value::ValueType;
 use fury_core::schema::registry::{FieldSchema, FieldType, ModelSchema};
-use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList, PyType};
+use pyo3::{exceptions::PyValueError, prelude::*};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -15,6 +15,49 @@ static DATE_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Cached reference to Python's `datetime.datetime` class for fast instantiation.
 static DATETIME_CLS: OnceLock<Py<PyAny>> = OnceLock::new();
+
+const DESCRIPTOR: &str = "__fury_model_descriptor__";
+
+#[pyclass(frozen)]
+struct ModelDescriptor(Arc<ModelSchema>);
+
+pub(crate) fn model_schema(model: &Bound<'_, PyAny>) -> PyResult<Arc<ModelSchema>> {
+    let descriptor = model
+        .cast::<PyType>()?
+        .getattr("__dict__")?
+        .get_item(DESCRIPTOR)
+        .map_err(|err| {
+            if err.is_instance_of::<pyo3::exceptions::PyKeyError>(model.py()) {
+                PyValueError::new_err("expected a registered FuRy model class")
+            } else {
+                err
+            }
+        })?;
+    Ok(Arc::clone(&descriptor.cast::<ModelDescriptor>()?.get().0))
+}
+
+fn schema_id(class: &Bound<'_, PyType>, name: String) -> PyResult<String> {
+    let value = class
+        .getattr("__dict__")?
+        .call_method1("get", ("__fury_schema_id__",))?;
+    if value.is_none() {
+        return Ok(name);
+    }
+    let id = value.extract::<String>()?;
+    let valid_segment = |segment: &str| {
+        let mut bytes = segment.bytes();
+        bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    if !id.contains('.') || !id.split('.').all(valid_segment) {
+        return Err(PyValueError::new_err(
+            "use a dotted schema ID such as billing.v1.Order",
+        ));
+    }
+    Ok(id)
+}
 
 /// Base model layout for FuRy high-performance binary serialization.
 ///
@@ -99,14 +142,20 @@ impl BaseModel {
             fields.push(FieldSchema::new(field_name, field_type, is_nullable));
         }
 
-        let schema = ModelSchema::new(name.clone(), fields);
+        let id = schema_id(_cls, name)?;
+        let schema = Arc::new(ModelSchema::new(id.clone(), fields));
         let emit = std::env::var_os("FURY_EMIT_MODELS").is_some();
-        get_global_registry()
-            .register_with_cache(schema, emit)
-            .map_err(fury_error_to_pyerr)?;
+        let registry = get_global_registry();
+        if id.contains('.') {
+            registry.register_stable_with_cache((*schema).clone(), emit)
+        } else {
+            registry.register_with_cache((*schema).clone(), emit)
+        }
+        .map_err(fury_error_to_pyerr)?;
+        _cls.setattr(DESCRIPTOR, Py::new(_cls.py(), ModelDescriptor(schema))?)?;
 
         if emit {
-            println!("__FURY_MODEL__:{name}");
+            println!("__FURY_MODEL__:{id}");
         }
 
         Ok(())

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quick Quiz</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script type="importmap">{"imports":{"@fury/wasm-core":"/wasm/fury_ts.js"}}</script>
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <header class="shell navigation">
+    <a class="brand" href="/"><span class="mark" aria-hidden="true">ϟ</span> Quick Quiz</a>
+    <nav aria-label="Account">
+      <span id="account" hidden></span>
+      <button class="plain" id="login" type="button">Log in</button>
+      <button class="primary" id="register" type="button">Create account</button>
+      <button class="plain" id="logout" type="button" hidden>Log out</button>
+    </nav>
+  </header>
+
+  <main class="shell">
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="intro">
+        <h1 id="hero-title">A little trivia.<br><i>A quick win.</i></h1>
+        <p>Three questions, no timer. Pick your answers and see how you rank.</p>
+        <a class="primary start" href="#question">Play the quiz <span aria-hidden="true">↘</span></a>
+      </div>
+      <form class="quiz" id="quiz">
+        <div class="quiz-top">
+          <p id="progress" aria-live="polite">Getting the questions ready…</p>
+          <progress id="meter" aria-label="Quiz progress" value="0" max="3"></progress>
+        </div>
+        <fieldset id="question" tabindex="-1">
+          <legend id="prompt"></legend>
+          <div id="choices"></div>
+        </fieldset>
+        <div class="quiz-bottom">
+          <p id="quiz-status" role="status"></p>
+          <button class="primary" id="next" type="submit" disabled>Next question</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="ranking" aria-labelledby="ranking-title">
+      <div>
+        <h2 id="ranking-title">Leaderboard</h2>
+        <p>Downloaded as FuRy records.</p>
+      </div>
+      <div>
+        <p id="ranking-status" role="status"></p>
+        <table aria-label="Leaderboard">
+          <thead><tr><th scope="col">Player</th><th scope="col">Score</th></tr></thead>
+          <tbody id="rankings"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="auth-dialog" aria-labelledby="auth-title">
+    <form id="auth-form">
+      <div class="auth-heading"><h2 id="auth-title"></h2><button type="button" id="close-auth" aria-label="Close">×</button></div>
+      <label>Username <input id="handle" name="handle" required minlength="3" maxlength="24" pattern="[a-z][a-z0-9_\-]*" autocomplete="username" aria-describedby="handle-help"></label>
+      <p id="handle-help">3–24 characters. Start with a lowercase letter.</p>
+      <label>Password <input name="password" type="password" required minlength="10" maxlength="128" autocomplete="current-password"></label>
+      <p id="auth-status" role="status"></p>
+      <button class="primary" id="auth-submit" type="submit"></button>
+    </form>
+  </dialog>
+</body>
+</html>

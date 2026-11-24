@@ -1,4 +1,4 @@
-/// Resource limits applied while validating and decoding an incoming wire-v2 frame.
+/// Resource limits applied while validating and decoding an incoming FuRy frame.
 ///
 /// Limit a transport's body size before allocating the input `Vec` as well. These
 /// checks bound parsing and materialization after the bytes have arrived. Unknown
@@ -34,6 +34,7 @@ pub(crate) const HARD_MAX_DEPTH: usize = 16;
 pub(crate) struct DecodeBudget<'a> {
     pub(crate) limits: &'a DecodeLimits,
     pub(crate) remaining: usize,
+    pub(crate) short_values: bool,
 }
 
 impl<'a> DecodeBudget<'a> {
@@ -41,6 +42,7 @@ impl<'a> DecodeBudget<'a> {
     pub(crate) fn new(limits: &'a DecodeLimits) -> Self {
         Self {
             limits,
+            short_values: true,
             remaining: limits.max_total_values,
         }
     }

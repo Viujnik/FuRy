@@ -41,14 +41,23 @@ fn a_failed_cache_import_preserves_the_existing_schema() {
     let encoding = SchemaRegistry::encode_schemas([&revised]).unwrap();
     let incomplete = &encoding[..encoding.len() - 1];
 
+    let observer = registry.clone();
+    let before = observer.revision().unwrap();
     assert!(registry.import_cache(incomplete).is_err());
+    assert_eq!(observer.revision(), Some(before));
     assert_eq!(registry.get("Reading").as_deref(), Some(&original));
 
     registry.import_cache(&encoding).unwrap();
+    assert_ne!(observer.revision(), Some(before));
     assert_eq!(registry.get("Reading").as_deref(), Some(&revised));
     assert!(registry
         .get("Reading")
         .unwrap()
         .find_field("label")
         .is_some());
+    let before_remove = observer.revision();
+    assert!(registry.remove("absent").is_none());
+    assert_eq!(observer.revision(), before_remove);
+    assert!(registry.remove("Reading").is_some());
+    assert_ne!(observer.revision(), before_remove);
 }

@@ -27,10 +27,10 @@ for (const [n, min, max] of [[rows, 1, 10000], [trials, values['baseline-wasm'] 
   if (!Number.isSafeInteger(n) || n < min || n > max) throw new Error('Invalid sample configuration');
 }
 
-async function writeFixtures(dir) {
+async function writeFixtures(dir, wasmPath) {
   const schema = fileURLToPath(new URL('./sample_schema.py', import.meta.url));
   execFileSync(process.env.FURY_BENCH_PYTHON ?? 'python3', ['-I', schema], { cwd: dir });
-  const { loadRegistry, WasmRecord } = await loadWasm();
+  const { loadRegistry, WasmRecord } = await loadWasm(wasmPath);
   const registry = await readFile(join(dir, '.fury_registry.bin'));
   loadRegistry(registry);
   const page = Array.from({ length: rows }, (_, i) => ({
@@ -60,7 +60,7 @@ async function writeFixtures(dir) {
   }
   await writeFile(join(dir, 'metadata.json'), JSON.stringify({
     fixture_version: 2, schema_name: 'BenchUser', order_by: 'id ASC', rows,
-    fury_layout: 'concatenated-v2-frames', fields: Object.keys(page[0]), sha256: hashes,
+    fury_layout: `concatenated-v${frames[0][5]}-frames`, fields: Object.keys(page[0]), sha256: hashes,
     read3_checksum: page.reduce((sum, row) => sum + row.id + row.username.length + Number(row.is_active), 0),
   }, null, 2));
 }
@@ -76,6 +76,16 @@ try {
     await writeFixtures(fixtures);
   }
   const fixtureMetadata = JSON.parse(await readFile(join(fixtures, 'metadata.json'), 'utf8'));
+  let baselineFixtures = fixtures;
+  if (values['baseline-wasm'] && !values.fixtures) {
+    baselineFixtures = join(scratch, 'baseline-fixtures');
+    await mkdir(baselineFixtures);
+    await writeFixtures(baselineFixtures, values['baseline-wasm']);
+    const base = JSON.parse(await readFile(join(baselineFixtures, 'metadata.json'), 'utf8'));
+    for (const file of ['wide.json', 'wide.msgpack', '.fury_registry.bin']) {
+      if (base.sha256[file] !== fixtureMetadata.sha256[file]) throw new Error('Different baseline corpus');
+    }
+  }
   await writeFile(join(out, 'run.json'), JSON.stringify({
     node: process.versions, platform: platform(), release: release(), arch: arch(),
     cpu: cpus()[0]?.model, trials, warmup, iterations, fixture: fixtureMetadata,
@@ -94,7 +104,7 @@ try {
         const env = { ...process.env };
         if (role === 'baseline') env.FURY_BENCH_WASM = resolve(values['baseline-wasm']);
         execFileSync(process.execPath, ['--expose-gc', runFile, '--variant', variant, '--out', resultPath,
-          '--fixtures', fixtures, '--warmup', String(warmup), '--iterations', String(iterations)],
+          '--fixtures', role === 'baseline' ? baselineFixtures : fixtures, '--warmup', String(warmup), '--iterations', String(iterations)],
         { env, stdio: 'inherit' });
         const result = JSON.parse(await readFile(resultPath, 'utf8'));
         if (!medians.has(variant)) medians.set(variant, { baseline: [], candidate: [] });

@@ -1,5 +1,5 @@
 use sqlx_core::query::query;
-use sqlx_postgres::PgPool;
+use sqlx_postgres::{PgPool, PgPoolOptions};
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -20,7 +20,24 @@ impl DatabasePool {
     ///
     /// Returns an error if the connection fails or the database is unreachable.
     pub async fn connect(connection_string: &str) -> Result<Self> {
-        let pool = PgPool::connect(connection_string).await?;
+        Self::connect_with_limit(connection_string, None).await
+    }
+
+    /// Connects with an optional explicit cap for concurrent database connections.
+    pub async fn connect_with_limit(
+        connection_string: &str,
+        max_connections: Option<u32>,
+    ) -> Result<Self> {
+        let mut options = PgPoolOptions::new();
+        if let Some(max) = max_connections {
+            if max == 0 {
+                return Err(crate::error::FuryError::Database(
+                    "max_connections must be positive".into(),
+                ));
+            }
+            options = options.max_connections(max);
+        }
+        let pool = options.connect(connection_string).await?;
         Ok(Self {
             inner: Arc::new(pool),
         })

@@ -1,8 +1,11 @@
 use crate::db::pool::DatabasePool;
 use crate::encoder::buffer::BinaryRecord;
+use crate::encoder::frame::append_row;
 use crate::encoder::value::ValueType;
+use crate::encoder::DecodeLimits;
 use crate::error::{FuryError, Result};
 use crate::schema::registry::{FieldType, ModelSchema, SchemaRegistry};
+use futures_util::TryStreamExt;
 use sqlx_core::arguments::Arguments;
 use sqlx_core::column::Column;
 use sqlx_core::decode::Decode;
@@ -77,6 +80,38 @@ impl QueryExecutor {
         Ok(rows)
     }
 
+    /// Streams one result set into a bounded page, in the order produced by the query.
+    /// Exceeding a limit fails the entire page. Applications can use LIMIT and keyset
+    /// pagination to control database-side work as well.
+    pub async fn fetch_page(
+        &self,
+        query: &str,
+        args: Vec<SqlValue>,
+        schema: &Arc<ModelSchema>,
+        max_rows: usize,
+    ) -> Result<Vec<u8>> {
+        let limits = DecodeLimits::default();
+        let row_limit = max_rows
+            .min(limits.max_collection_items)
+            .min(limits.max_total_values / schema.fields_count().max(1));
+        let mut frames = Vec::new();
+        let mut rows = self.prepare_query(query, args)?.fetch(self.pool.inner());
+        let mut count = 0;
+        while let Some(row) = rows.try_next().await? {
+            if count >= row_limit {
+                return Err(FuryError::Encoding("page row limit exceeded".into()));
+            }
+            if count == 0 {
+                Self::validate_projection(&row, schema)?;
+            }
+            append_row(&mut frames, schema, &limits, |field| {
+                self.extract_value(&row, field.name(), field.field_type())
+            })?;
+            count += 1;
+        }
+        Ok(frames)
+    }
+
     /// Executes a statement and returns the driver-reported affected row count.
     ///
     /// Unlike `execute_raw` (`fetch_all`), this uses sqlx `execute()`, which for
@@ -103,6 +138,11 @@ impl QueryExecutor {
     ///
     /// Returns an error if field extraction or type conversion fails.
     pub fn row_to_buffer(&self, row: &PgRow, schema: &Arc<ModelSchema>) -> Result<BinaryRecord> {
+        Self::validate_projection(row, schema)?;
+        self.encode_row(row, schema)
+    }
+
+    fn validate_projection(row: &PgRow, schema: &ModelSchema) -> Result<()> {
         for column in row.columns() {
             let name = column.name();
             if schema.find_field(name).is_some()
@@ -113,6 +153,10 @@ impl QueryExecutor {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn encode_row(&self, row: &PgRow, schema: &Arc<ModelSchema>) -> Result<BinaryRecord> {
         let mut builder = BinaryRecord::new(Arc::clone(schema));
 
         for field in schema.fields() {

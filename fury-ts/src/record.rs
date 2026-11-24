@@ -2,10 +2,11 @@ use crate::get_global_registry;
 use fury_core::encoder::buffer::BinaryRecord;
 use fury_core::encoder::value::ValueType;
 use fury_core::schema::field::FieldType;
-use fury_core::schema::registry::FieldSchema;
+use fury_core::schema::registry::{FieldSchema, ModelSchema};
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
-const MAX_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
+pub(crate) const MAX_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
 
 /// Represents a binary record mapped to a specific schema in WebAssembly.
 ///
@@ -14,6 +15,85 @@ const MAX_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
 #[wasm_bindgen]
 pub struct WasmRecord {
     inner: BinaryRecord,
+}
+
+struct CachedSchema {
+    name: js_sys::JsString,
+    schema: Arc<ModelSchema>,
+    revision: usize,
+}
+
+thread_local! {
+    static LAST_SCHEMA: std::cell::RefCell<Option<CachedSchema>> = const { std::cell::RefCell::new(None) };
+}
+
+fn resolve_model(name: &js_sys::JsString) -> Result<Arc<ModelSchema>, JsValue> {
+    let registry = get_global_registry();
+    let revision = registry.revision();
+    let cached = LAST_SCHEMA.with_borrow(|last| {
+        let last = last.as_ref()?;
+        (Some(last.revision) == revision && last.name == *name).then(|| Arc::clone(&last.schema))
+    });
+    if let Some(schema) = cached {
+        return Ok(schema);
+    }
+    if !name.is_string() || name.length() > u8::MAX.into() {
+        return Err(JsValue::from_str(
+            "expected a model name within the schema limit",
+        ));
+    }
+    let key = String::from(name);
+    let schema = registry.get(&key).ok_or_else(|| {
+        JsValue::from_str(&format!(
+            "Schema '{key}' absent from registry — call loadRegistry() first"
+        ))
+    })?;
+    if let Some(revision) = revision {
+        LAST_SCHEMA.set(Some(CachedSchema {
+            name: name.clone(),
+            schema: Arc::clone(&schema),
+            revision,
+        }));
+    }
+    Ok(schema)
+}
+
+impl WasmRecord {
+    /// Construct from bytes already owned by Rust.
+    pub fn new(schema_name: &str, buffer: Option<Vec<u8>>) -> Result<Self, JsValue> {
+        let schema = get_global_registry().get(schema_name).ok_or_else(|| {
+            JsValue::from_str(&format!(
+                "Schema '{schema_name}' absent from registry — call loadRegistry() first"
+            ))
+        })?;
+        Self::from_buffer(schema, buffer)
+    }
+
+    /// Set a string from a borrowed Rust value.
+    pub fn set_string(&mut self, field_name: &str, value: &str) -> Result<(), JsValue> {
+        self.set_string_js(field_name, value.to_owned())
+    }
+
+    pub(crate) fn with_schema(
+        schema: Arc<ModelSchema>,
+        buffer: Option<&js_sys::Uint8Array>,
+    ) -> Result<Self, JsValue> {
+        if buffer.is_some_and(|data| {
+            data.length() as usize > fury_core::encoder::DecodeLimits::default().max_frame_bytes
+        }) {
+            return Err(JsValue::from_str("record exceeds byte limit"));
+        }
+        Self::from_buffer(schema, buffer.map(js_sys::Uint8Array::to_vec))
+    }
+
+    fn from_buffer(schema: Arc<ModelSchema>, buffer: Option<Vec<u8>>) -> Result<Self, JsValue> {
+        let inner = match buffer {
+            Some(data) => BinaryRecord::from_raw_bytes(data, &schema)
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+            None => BinaryRecord::new(schema),
+        };
+        Ok(Self { inner })
+    }
 }
 
 #[wasm_bindgen]
@@ -28,20 +108,13 @@ impl WasmRecord {
     /// Returns a `JsValue` error if the schema is not found in the global registry
     /// or if the binary data fails to parse.
     #[wasm_bindgen(constructor)]
-    pub fn new(schema_name: &str, buffer: Option<Vec<u8>>) -> Result<WasmRecord, JsValue> {
-        let schema = get_global_registry().get(schema_name).ok_or_else(|| {
-            JsValue::from_str(&format!(
-                "Schema '{schema_name}' absent from registry — call loadRegistry() first"
-            ))
-        })?;
-
-        let record = match buffer {
-            Some(data) => BinaryRecord::from_raw_bytes(data, &schema)
-                .map_err(|e| JsValue::from_str(&format!("Binary stream parsing violation: {e}")))?,
-            None => BinaryRecord::new(schema),
-        };
-
-        Ok(WasmRecord { inner: record })
+    pub fn from_js(
+        schema_name: &js_sys::JsString,
+        #[wasm_bindgen(unchecked_optional_param_type = "Uint8Array | null")]
+        buffer: &js_sys::Uint8Array,
+    ) -> Result<WasmRecord, JsValue> {
+        let schema = resolve_model(schema_name)?;
+        Self::with_schema(schema, (!buffer.is_null_or_undefined()).then_some(buffer))
     }
 
     #[inline]
@@ -54,14 +127,13 @@ impl WasmRecord {
 
     #[inline]
     fn decode(&self, field_name: &str) -> Result<ValueType, JsValue> {
-        let field = self.field_schema(field_name)?;
-        let bytes = self
-            .inner
-            .get_field_bytes(field_name)
-            .ok_or_else(|| JsValue::from_str(&format!("Field '{field_name}' was never set")))?;
-
-        ValueType::from_bytes(bytes, field.field_type())
-            .ok_or_else(|| JsValue::from_str(&format!("Corrupt bytes in field '{field_name}'")))
+        if let Some(value) = self.inner.get_field_value(field_name) {
+            return Ok(value);
+        }
+        self.field_schema(field_name)?;
+        Err(JsValue::from_str(&format!(
+            "Field '{field_name}' was never set"
+        )))
     }
 
     /// Retrieves a numeric field value as an `f64` (JavaScript's native number type).
@@ -193,10 +265,10 @@ impl WasmRecord {
         }
     }
 
-    /// Re-allocates and writes a new string value, shifting subsequent field offsets.
+    /// Moves the string received from JavaScript into the record setter.
     #[wasm_bindgen(js_name = setString)]
-    pub fn set_string(&mut self, field_name: &str, value: &str) -> Result<(), JsValue> {
-        self.set_field(field_name, ValueType::String(value.to_owned()))
+    pub fn set_string_js(&mut self, field_name: &str, value: String) -> Result<(), JsValue> {
+        self.set_field(field_name, ValueType::String(value))
     }
 
     /// Reads a single byte to evaluate a native boolean value.
@@ -279,7 +351,14 @@ impl WasmRecord {
     }
 
     #[wasm_bindgen(js_name = setBytes)]
-    pub fn set_bytes(&mut self, field_name: &str, value: &[u8]) -> Result<(), JsValue> {
+    pub fn set_bytes(
+        &mut self,
+        field_name: &str,
+        value: &js_sys::Uint8Array,
+    ) -> Result<(), JsValue> {
+        if value.length() as usize > fury_core::encoder::DecodeLimits::default().max_frame_bytes {
+            return Err(JsValue::from_str("bytes exceed frame limit"));
+        }
         self.set_field(field_name, ValueType::Bytes(value.to_vec()))
     }
 

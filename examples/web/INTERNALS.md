@@ -26,7 +26,7 @@ sequenceDiagram
     R->>D: Query over the Unix socket
     D-->>R: Typed rows
     R-->>P: Models backed by binary records
-    P-->>B: HTTP body with three wire-v2 frames
+    P-->>B: HTTP body with three FuRy frames
     Note over B: WASM reads fields and JS populates the DOM
 ```
 
@@ -52,7 +52,7 @@ wc -c "$trace_dir/page.fury"
 xxd -g1 -l96 "$trace_dir/page.fury"
 ```
 
-A local capture returned HTTP 200 and 242 bytes across frames of 74, 82, and 86 bytes. The first six bytes, `4a 00 00 00 46 02`, encode a little-endian length of 74, the `F` marker, and version 2. The following `02 69 64` encodes the two-byte field name `id`, `09 00 00 00` gives the field value length, and `01` marks a present value before the eight-byte integer. See the [wire format](../../fury-core/README.md).
+The first four bytes give the length of the first frame. The next two are the marker `46` (F) and version `03`. [Walk through a complete field](../../fury-core/README.md)
 
 In browser DevTools, use **Network** to examine the WASM, registry, and data requests. Use **Performance** for runtime and rendering and **Memory** for the JS heap. Separate cold runs from warmed runs.
 

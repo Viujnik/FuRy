@@ -1,4 +1,4 @@
-//! Minimal wire-v2 round trip with an application-supplied schema.
+//! Minimal FuRy round trip with an application-supplied schema.
 use fury_core::encoder::buffer::BinaryRecord;
 use fury_core::encoder::value::ValueType;
 use fury_core::schema::registry::{FieldSchema, FieldType, ModelSchema};

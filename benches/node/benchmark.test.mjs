@@ -3,7 +3,7 @@ import test from 'node:test';
 import { median, splitFuryFrames } from './harness.mjs';
 import { comparePairs } from './compare.mjs';
 
-const frame = () => Uint8Array.of(6, 0, 0, 0, 70, 2);
+const frame = () => Uint8Array.of(6, 0, 0, 0, 70, 3);
 
 test('split consumes complete ordered frames at a nonzero source offset', () => {
   const bytes = Uint8Array.from([0, ...frame(), ...frame(), 0]).subarray(1, 13);

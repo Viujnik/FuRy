@@ -11,7 +11,7 @@ export function splitFuryFrames(bytes) {
     if (bytes.length - start < 6) throw new Error('Truncated Fury header');
     const length = view.getUint32(start, true);
     if (length < 6 || length > bytes.length - start) throw new Error('Invalid Fury frame length');
-    if (bytes[start + 4] !== 70 || bytes[start + 5] !== 2) throw new Error('Incorrect Fury version');
+    if (bytes[start + 4] !== 70 || ![2, 3].includes(bytes[start + 5])) throw new Error('Incorrect Fury version');
     frames.push(bytes.subarray(start, start + length));
     start += length;
   }

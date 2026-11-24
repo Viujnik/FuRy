@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "dependencies": {
+    "@apache-fory/core": "1.7.8",
+    "protobufjs": "^8.0.0"
+  }
+}
